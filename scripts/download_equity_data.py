@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
+from data_pipeline.common import DEFAULT_DATA_DIR
 from data_pipeline.equity import MassiveHistoricalDataLoader
 
 def main() -> None:
@@ -11,7 +12,7 @@ def main() -> None:
     )
     parser.add_argument("--dates", nargs="+", required=True)
     parser.add_argument("--tickers", nargs="+", required=True)
-    parser.add_argument("--data-dir", default="./market_data")
+    parser.add_argument("--data-dir", default=DEFAULT_DATA_DIR)
     parser.add_argument("--output", type=Path)
     parser.add_argument("--match", choices=("exact", "backward"), default="exact")
     parser.add_argument("--tolerance", default="1min")

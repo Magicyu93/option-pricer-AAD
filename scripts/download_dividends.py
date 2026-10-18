@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
+from data_pipeline.common import DEFAULT_DATA_DIR
 from data_pipeline.dividends import DividendsDataLoader
 
 
@@ -13,7 +14,7 @@ def main() -> None:
     parser.add_argument("--tickers", nargs="+", required=True)
     parser.add_argument("--start", required=True)
     parser.add_argument("--end", required=True)
-    parser.add_argument("--data-dir", default="./market_data")
+    parser.add_argument("--data-dir", default=DEFAULT_DATA_DIR)
     parser.add_argument("--output", type=Path)
     parser.add_argument("--refresh", action="store_true")
     args = parser.parse_args()

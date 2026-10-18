@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
+from data_pipeline.common import DEFAULT_DATA_DIR
 from data_pipeline.rates import TREASURY_CMT_SERIES, RatesDataLoader
 
 
@@ -22,7 +23,7 @@ def main() -> None:
         nargs="+",
         help=f"series IDs; defaults to the Treasury curve {' '.join(TREASURY_CMT_SERIES)}",
     )
-    parser.add_argument("--data-dir", default="./market_data")
+    parser.add_argument("--data-dir", default=DEFAULT_DATA_DIR)
     parser.add_argument("--output", type=Path)
     parser.add_argument("--refresh", action="store_true")
     args = parser.parse_args()

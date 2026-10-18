@@ -18,7 +18,6 @@ fetches what is missing.  Credentials come from the environment:
 
 from __future__ import annotations
 
-import datetime as dt
 import sys
 from pathlib import Path
 
@@ -26,17 +25,14 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 # Make the repo root importable when run as a file, without installing it.
 sys.path.insert(0, str(REPO_ROOT))
 
-import pandas as pd
-
-from data_pipeline.dividends import DividendsDataLoader
-from data_pipeline.equity import MassiveHistoricalDataLoader
-from data_pipeline.rates import TREASURY_CMT_SERIES, RatesDataLoader
+from data_pipeline.common import DEFAULT_DATA_DIR
+from data_pipeline.download import download_dividends, download_equity, download_rates
 
 # -- settings ------------------------------------------------------------------
 TICKERS = ["SPY", "SPX"]
 START = "2026-09-08"
 END = "2026-09-11"
-DATA_DIR = REPO_ROOT / "market_data"  # fixed, whichever folder you run from
+DATA_DIR = DEFAULT_DATA_DIR  # <repo>/market_data, whichever folder you run from
 
 DOWNLOAD_EQUITY = True
 DOWNLOAD_RATES = True
@@ -49,51 +45,15 @@ REFRESH = False  # refetch rates and dividends even if cached
 # ------------------------------------------------------------------------------
 
 
-def download_equity(tickers, start, end, data_dir=DATA_DIR):
-    """Options joined to their underlying, one trading day at a time.
-
-    Returns the days that failed; a failed day does not stop the others.
-    """
-    loader = MassiveHistoricalDataLoader(data_dir=data_dir)
-    failed = []
-    for day in pd.bdate_range(start, end).strftime("%Y-%m-%d"):
-        try:
-            rows = len(loader.load_market([day], tickers))
-            print(f"equity {day}: {rows:,} rows" if rows else f"equity {day}: no data")
-        except Exception as exc:
-            print(f"equity {day}: FAILED -- {exc}")
-            failed.append(day)
-    return failed
-
-
-def download_rates(start, end, data_dir=DATA_DIR):
-    """Treasury yields, starting early enough to cover the first day."""
-    first = pd.Timestamp(start).date() - dt.timedelta(days=RATES_LOOKBACK_DAYS)
-    loader = RatesDataLoader(RATES_PROVIDER, data_dir=data_dir)
-    frame = loader.load(TREASURY_CMT_SERIES, first, end, refresh=REFRESH)
-    print(f"rates ({RATES_PROVIDER}) {first} to {end}: {len(frame):,} rows")
-    return frame
-
-
-def download_dividends(tickers, start, end, data_dir=DATA_DIR):
-    """Declared dividends through the horizon after ``end``; indices skipped."""
-    last = pd.Timestamp(end).date() + dt.timedelta(days=DIVIDEND_HORIZON_DAYS)
-    equity = MassiveHistoricalDataLoader(data_dir=data_dir, verbose=False)
-    loader = DividendsDataLoader(data_dir=data_dir)
-    for ticker in tickers:
-        if equity.infer_underlying_asset(ticker, date=start) == "indices":
-            print(f"dividends {ticker}: index, skipped")
-            continue
-        frame = loader.load(ticker, start, last, refresh=REFRESH)
-        print(f"dividends {ticker} {start} to {last}: {len(frame):,} rows")
-
-
 if __name__ == "__main__":
     if DOWNLOAD_EQUITY:
-        failed = download_equity(TICKERS, START, END)
+        results = download_equity(TICKERS, START, END, data_dir=DATA_DIR, on_progress=print)
+        failed = [r.label for r in results if not r.ok]
         if failed:
             print(f"equity failed for {failed}; rerun to retry them")
     if DOWNLOAD_RATES:
-        download_rates(START, END)
+        download_rates(START, END, provider=RATES_PROVIDER, lookback_days=RATES_LOOKBACK_DAYS,
+                       refresh=REFRESH, data_dir=DATA_DIR, on_progress=print)
     if DOWNLOAD_DIVIDENDS:
-        download_dividends(TICKERS, START, END)
+        download_dividends(TICKERS, START, END, horizon_days=DIVIDEND_HORIZON_DAYS,
+                           refresh=REFRESH, data_dir=DATA_DIR, on_progress=print)

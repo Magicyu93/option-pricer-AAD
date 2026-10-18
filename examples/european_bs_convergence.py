@@ -156,7 +156,7 @@ def _style(ax, title: str, xlabel: str, ylabel: str) -> None:
         ax.spines[side].set_color(GRID)
 
 
-def plot(ref, sampling, greeks, steps, path="convergence.png") -> None:
+def plot(ref, sampling, greeks, steps, path="european_bs_convergence.png") -> None:
     fig, axes = plt.subplots(2, 2, figsize=(11.5, 8.4), facecolor=SURFACE)
     fig.patch.set_facecolor(SURFACE)
     for ax in axes.flat:

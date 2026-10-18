@@ -17,6 +17,10 @@ from botocore.exceptions import ClientError
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
+# Weekly / PM-settled roots (SPXW, NDXP, ...) are options on another root's
+# underlying. One map for the whole pipeline: the current loader uses it too.
+from .equity.massive.schema import option_underlying
+
 
 TickerInput = str | Sequence[str]
 DateInput = str | pd.Timestamp | Sequence[str | pd.Timestamp]
@@ -1025,8 +1029,12 @@ class MassiveHistoricalDataLoader:
                 # O:<root><YYMMDD><C/P><8-digit strike>
                 # The suffix is fixed at 15 characters.  Parsing from the right
                 # avoids making assumptions about valid underlying characters.
+                # A root counts when it *maps* to a requested underlying,
+                # so "SPX" also scans in its SPXW weeklies.
                 roots = symbols.str.slice(2, -15)
-                mask = symbols.str.startswith("O:", na=False) & roots.isin(wanted)
+                mask = symbols.str.startswith("O:", na=False) & option_underlying(
+                    roots
+                ).isin(wanted)
 
             selected = chunk.loc[mask].copy()
             if not selected.empty:
@@ -1073,7 +1081,8 @@ class MassiveHistoricalDataLoader:
         self._ensure_columns(df, ["volume", "transactions"])
 
         symbols = df["ticker"].astype("string")
-        df["underlying"] = symbols.str.slice(2, -15)
+        df["option_root"] = symbols.str.slice(2, -15)
+        df["underlying"] = option_underlying(df["option_root"])
         expiration_code = symbols.str.slice(-15, -9)
         type_code = symbols.str.slice(-9, -8)
         strike_code = symbols.str.slice(-8)
@@ -1109,6 +1118,7 @@ class MassiveHistoricalDataLoader:
             "session_date",
             "timestamp",
             "underlying",
+            "option_root",
             "option_ticker",
             "expiration",
             "option_type",
@@ -1510,6 +1520,19 @@ class MassiveHistoricalDataLoader:
     ) -> Path:
         return self._cache_path(asset, date, ticker).with_name(".empty")
 
+    @staticmethod
+    def _cache_is_current(asset: FlatAsset, path: Path) -> bool:
+        """Whether a cached options file was written with the root mapping.
+
+        A file without ``option_root`` predates it, so it lacks the weekly
+        roots (most of SPX volume): a miss to rebuild from the raw file.
+        """
+        if asset != "options":
+            return True
+        import pyarrow.parquet as pq
+
+        return "option_root" in pq.read_schema(path).names
+
     def _read_cache(
         self,
         asset: FlatAsset,
@@ -1526,7 +1549,7 @@ class MassiveHistoricalDataLoader:
             path = self._cache_path(asset, date, ticker)
             empty_marker = self._empty_cache_marker(asset, date, ticker)
 
-            if path.exists():
+            if path.exists() and self._cache_is_current(asset, path):
                 frames.append(pd.read_parquet(path))
             elif empty_marker.exists():
                 continue

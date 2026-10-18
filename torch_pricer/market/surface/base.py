@@ -36,6 +36,8 @@ import datetime as dt
 from abc import ABC, abstractmethod
 from itertools import chain
 
+import numpy as np
+import torch
 import torch.nn as nn
 from torch import Tensor
 
@@ -67,6 +69,15 @@ class VolSurface(nn.Module, ABC):
         """``sqrt(w(k, T) / T)``."""
         t = self._as_tensor(expiry)
         return (self.total_variance(k, t) / t).sqrt()
+
+    def implied_vol_grid(self, k, expiries) -> np.ndarray:
+        """Implied vols on a grid, for display: shape ``(len(expiries), len(k))``.
+
+        Evaluated without gradients and returned as numpy, one row per expiry.
+        """
+        k = self._as_tensor(np.asarray(k, dtype=float))
+        with torch.no_grad():
+            return np.stack([self.implied_vol(k, float(t)).cpu().numpy() for t in np.asarray(expiries)])
 
     def constraints(self) -> dict[str, dict[str, float]]:
         """Each no-arbitrage bound the parametrisation enforces: ``{name: {value, bound}}``.

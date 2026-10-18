@@ -1,6 +1,6 @@
 """Provider-aware raw market-data pipelines."""
 
-from .coverage import cached_days, coverage
+from .coverage import cached_days, coverage, frame_summary, read_cached
 from .dividends import DividendsDataLoader, MassiveDividendsSource
 from .download import (
     DownloadResult,
@@ -21,6 +21,8 @@ __all__ = [
     "DownloadResult",
     "cached_days",
     "coverage",
+    "frame_summary",
+    "read_cached",
     "credentials_status",
     "download_dividends",
     "download_equity",

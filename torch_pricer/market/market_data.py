@@ -184,8 +184,10 @@ def window_bars(
     bars = keep(bars["matched_underlying"].astype(bool), "no spot in the same minute", bars)
     bars = keep(bars["option_close"] >= config.min_price, "below minimum price", bars)
 
-    settlement = bars["option_root"].map({r: product.settlement(r) for r in set(bars["option_root"])})
-    am = settlement == Settlement.AM
+    # Hold the plain values: Settlement is a str enum, and pandas 3 stores a mapped str
+    # enum as a str dtype, dropping the enum -- convert back only where its method is needed.
+    settlement = bars["option_root"].map({r: product.settlement(r).value for r in set(bars["option_root"])})
+    am = settlement == Settlement.AM.value
     pm_dates = set(bars.loc[~am, "expiration"])
     shadowed = am & bars["expiration"].isin(pm_dates)
     bars, settlement = keep(~shadowed, "AM series shadowed by PM weekly", bars), settlement[~shadowed]
@@ -193,13 +195,13 @@ def window_bars(
     expiry = bars["expiration"].dt.date
     years = {d: year_fraction(as_of, d, day_count) for d in set(expiry)}
     one_day = year_fraction(as_of, as_of + dt.timedelta(days=1), day_count)
-    early = settlement.map(lambda s: s.hours_before_close() / 24.0 * one_day)
+    early = settlement.map(lambda s: Settlement(s).hours_before_close() / 24.0 * one_day)
     out = pd.DataFrame(
         {
             "timestamp": bars["option_timestamp"],
             "expiry": expiry,
             "option_root": bars["option_root"],
-            "settlement": settlement.map(lambda s: s.value),
+            "settlement": settlement,
             "right": np.where(bars["option_type"] == "call", 1, -1),
             "strike": bars["strike"].astype(float),
             "price": bars["option_close"].astype(float),
