@@ -57,10 +57,11 @@ def option_quotes(
     """One quote per contract, its vol averaged over the window's bars.
 
     ``bars`` is :func:`~torch_pricer.market.market_data.window_bars` output and
-    ``forwards`` is :func:`~torch_pricer.market.curve.calibration.parity_forwards`
-    output. Each bar's forward is its expiry's forward-to-spot ratio times the
-    bar's own spot. Only out-of-the-money options inside the moneyness band are
-    kept.
+    ``forwards`` is :func:`~torch_pricer.market.parity.parity_forwards` output.
+    Each bar is priced at its own ``T``: its forward is the bar's spot grown at
+    the expiry's rate ``ln(ratio) / T_close``, and its discount the expiry's
+    rate held to ``T``. Only out-of-the-money options inside the moneyness band
+    are kept.
 
     Returns the quotes, the per-bar frame they came from (with ``forward``,
     ``k`` and ``iv``), and the bars dropped, by reason.
@@ -73,9 +74,11 @@ def option_quotes(
 
     fwd = forwards.set_index("expiry")
     bars = keep(bars["expiry"].isin(fwd.index), "no forward for expiry", bars)
+    expiry = fwd.loc[bars["expiry"]]
+    held = bars["T"].to_numpy() / expiry["T"].to_numpy()  # T / T_close
     bars = bars.assign(
-        forward=bars["spot"].to_numpy() * fwd.loc[bars["expiry"], "ratio"].to_numpy(),
-        discount=fwd.loc[bars["expiry"], "discount"].to_numpy(),
+        forward=bars["spot"].to_numpy() * expiry["ratio"].to_numpy() ** held,
+        discount=expiry["discount"].to_numpy() ** held,
     )
     bars = bars.assign(k=np.log(bars["strike"] / bars["forward"]))
     otm = np.where(bars["right"] > 0, bars["k"] >= 0, bars["k"] < 0)

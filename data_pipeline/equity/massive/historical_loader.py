@@ -281,6 +281,9 @@ class MassiveHistoricalDataLoader:
 
         Ticker-reference discovery is only a defensive fallback when contract
         metadata is unavailable or incomplete.
+
+        A ticker classified before is answered from the asset-type cache, with
+        no metadata fields; pass ``refresh=True`` to query the API again.
         """
         raw = ticker.strip().upper()
         if not raw:
@@ -290,6 +293,18 @@ class MassiveHistoricalDataLoader:
 
         if underlying_asset not in {"auto", "stocks", "indices"}:
             raise ValueError("underlying_asset must be 'auto', 'stocks', or 'indices'")
+
+        if underlying_asset == "auto" and not refresh and canonical in self._asset_type_cache:
+            # Routing needs only the asset class, and it does not change: answer from the
+            # cache instead of a REST round trip on every load, which also works offline.
+            asset = self._asset_type_cache[canonical]
+            return UnderlyingSpec(
+                canonical_ticker=canonical,
+                asset_type=asset,
+                provider_ticker=f"I:{canonical}" if asset == "indices" else canonical,
+                source_option_ticker=option_ticker,
+                metadata_source="cache",
+            )
 
         metadata: dict | None = None
         if self.api_key:
@@ -494,6 +509,15 @@ class MassiveHistoricalDataLoader:
             option_rows=options,
         )
         underlyings = self._load_underlyings_from_specs(dates_, specs)
+        with_spot = set(underlyings["underlying"].astype(str)) if not underlyings.empty else set()
+        traded = set(options["underlying"].astype(str)) if not options.empty else set()
+        for ticker in sorted(traded - with_spot):
+            warnings.warn(
+                f"No {specs[ticker].asset_type} bars for {ticker} on {', '.join(dates_)}: "
+                "its options are returned without a spot.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
 
         if include_contract_metadata and not options.empty:
             options = self.add_contract_metadata(options)
@@ -1214,8 +1238,12 @@ class MassiveHistoricalDataLoader:
             return pd.read_parquet(cache_path)
 
         metadata = self._fetch_contract_metadata(date, underlying)
+        if metadata.empty:  # cached too: a past date's contract list does not change
+            metadata = pd.DataFrame(
+                columns=["session_date", "underlying", "option_ticker", *self._contract_metadata_columns()]
+            )
 
-        if self.cache_parquet and not metadata.empty:
+        if self.cache_parquet:
             cache_path.parent.mkdir(parents=True, exist_ok=True)
             self._write_parquet(metadata, cache_path)
 
@@ -1338,13 +1366,23 @@ class MassiveHistoricalDataLoader:
             empty_marker = self._empty_cache_marker(asset, date, ticker)
 
             if path.exists() and self._cache_is_current(asset, path):
-                frames.append(pd.read_parquet(path))
+                frames.append(self._in_timezone(pd.read_parquet(path)))
             elif empty_marker.exists():
                 continue
             else:
                 missing.append(ticker)
 
         return self._concat(frames), missing
+
+    def _in_timezone(self, frame: pd.DataFrame) -> pd.DataFrame:
+        """A cached frame with its timestamps in this loader's time zone.
+
+        The cache holds instants; the zone they were written in is the writing
+        loader's choice, so a loader with another ``timezone`` converts on read.
+        """
+        if "timestamp" in frame.columns and frame["timestamp"].dt.tz is not None:
+            frame["timestamp"] = frame["timestamp"].dt.tz_convert(self.timezone)
+        return frame
 
     @staticmethod
     def _cache_is_current(asset: FlatAsset, path: Path) -> bool:
@@ -1599,6 +1637,6 @@ class MassiveHistoricalDataLoader:
 
 if __name__ == "__main__":
     raise SystemExit(
-        "Use scripts/download_equity_data.py or import "
+        "Use scripts/download_market_data.py or import "
         "data_pipeline.equity.MassiveHistoricalDataLoader."
     )

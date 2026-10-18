@@ -37,12 +37,7 @@ from torch_pricer.calibration import CalibrationInputs, CalibrationResult
 from torch_pricer.conventions import DEFAULT_DAY_COUNT
 from torch_pricer.errors import ValidationError
 from torch_pricer.instruments.listed import OptionProduct
-from torch_pricer.market.curve.calibration import (
-    CURVE_MODELS,
-    implied_carry_curve,
-    parity_forwards,
-    parity_pairs,
-)
+from torch_pricer.market.curve.calibration import CURVE_MODELS, implied_carry_curve
 from torch_pricer.market.market_data import (
     QuoteConfig,
     QuoteSet,
@@ -51,6 +46,7 @@ from torch_pricer.market.market_data import (
     reference_spot,
     window_bars,
 )
+from torch_pricer.market.parity import MONEYNESS_BAND, parity_forwards, parity_pairs
 from torch_pricer.market.snapshot import MarketSnapshot
 from torch_pricer.market.surface.calibration import SURFACE_MODELS, fit_surface, option_quotes
 
@@ -63,8 +59,8 @@ class SnapshotSettings:
     quote_config: QuoteConfig = field(default_factory=QuoteConfig)
     curve_model: str = "Treasury bootstrap"
     surface_model: str = "SSVI"
-    max_pairs: int = 10
-    min_pairs: int = 2
+    moneyness_band: float = MONEYNESS_BAND  # parity pairs: |K/S - 1| below this
+    min_pairs: int = 2  # an expiry's forward from parity needs this many pairs
     max_iter: int = 500
     day_count: str = DEFAULT_DAY_COUNT  # the snapshot's, and so every T in the run
 
@@ -91,7 +87,7 @@ class SnapshotRun:
     product: OptionProduct
     observations: QuoteSet  # spot, option quotes (with implied vols), par yields
     bars: pd.DataFrame  # the observation window's minute bars
-    pairs: pd.DataFrame  # same-minute call/put pairs, and which were used
+    pairs: pd.DataFrame  # same-minute call/put pairs near the money, the forwards' input
     forwards: pd.DataFrame  # one forward per expiry
     quote_bars: pd.DataFrame  # per-bar forwards and implied vols behind the quotes
     result: CalibrationResult  # the surface fit
@@ -178,23 +174,20 @@ def build_snapshot(
 
     # 3. Forwards from put-call parity, and the carry that reproduces them.
     started = time.perf_counter()
-    pairs = parity_pairs(bars, curve, max_pairs=settings.max_pairs)
+    pairs = parity_pairs(bars, settings.moneyness_band)
     record(
-        "Put-call pairs", parity_pairs, {"max_pairs": settings.max_pairs},
+        "Put-call pairs", parity_pairs, {"moneyness_band": settings.moneyness_band},
         {"bars kept": len(bars)},
-        {"pairs": len(pairs), "used": int(pairs["used"].sum()),
+        {"pairs": len(pairs), "box prints": int(pairs["is_box"].sum()),
          "expiries with pairs": pairs["expiry"].nunique()},
         {}, started, "pairs",
     )
 
     started = time.perf_counter()
-    forwards = parity_forwards(
-        bars, curve, spot, max_pairs=settings.max_pairs, min_pairs=settings.min_pairs, pairs=pairs
-    )
+    forwards = parity_forwards(bars, curve, spot, min_pairs=settings.min_pairs, pairs=pairs)
     record(
-        "Parity forwards", parity_forwards,
-        {"max_pairs": settings.max_pairs, "min_pairs": settings.min_pairs},
-        {"pairs used": int(pairs["used"].sum()), "expiries": len(forwards)},
+        "Parity forwards", parity_forwards, {"min_pairs": settings.min_pairs},
+        {"pairs": len(pairs), "expiries": len(forwards)},
         {"from parity": int((forwards["source"] == "parity").sum()),
          "interpolated": int((forwards["source"] == "interpolated").sum())},
         {}, started, "forwards",

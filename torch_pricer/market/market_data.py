@@ -1,7 +1,7 @@
 """What the market actually publishes.
 
 These are the inputs to the curve and surface calibrations
-(:mod:`torch_pricer.market.curve.calibration`,
+(:mod:`torch_pricer.market.curve.calibration`, :mod:`torch_pricer.market.parity`,
 :mod:`torch_pricer.market.surface.calibration`), kept strictly separate from
 their outputs. A quote is an observation with a bid, an ask and a timestamp; a
 curve or a vol model is a fitted object with parameters. Collapsing the two --
@@ -131,6 +131,8 @@ class QuoteSet:
 # -- minute trade bars ---------------------------------------------------------
 
 TIMEZONE = "America/New_York"
+#: The regular session's close: PM-settled options settle on it, and the index stops printing.
+MARKET_CLOSE = dt.time(16, 0)
 
 @dataclass(frozen=True)
 class QuoteConfig:
@@ -142,11 +144,43 @@ class QuoteConfig:
     """
 
     window_start: str = "15:45"  # ET, inclusive
-    window_end: str = "16:00"  # ET, exclusive: the index stops printing at 16:00
-    min_days: int = 7  # a date-only snapshot cannot resolve shorter expiries
+    #: ET, exclusive. A bar is stamped with its minute's start, so the 16:00 bar holds
+    #: trades from 16:00:00 on: after the index's closing print, priced off a spot that
+    #: no longer moves while the futures do.
+    window_end: str = "16:00"
+    min_days: int = 7  # calendar days to expiry; shorter expiries stay out of the surface
     min_price: float = 0.05  # one tick: below it a trade price is noise
     #: Keep ``|ln(K/F)| <= max_abs_k * sqrt(T)``: a band that widens with maturity.
     max_abs_k: float = 1.0
+
+
+def time_to_settlement(
+    observed_at: pd.Series,
+    expiry: pd.Series,
+    settlement: pd.Series,
+    day_count: str = DEFAULT_DAY_COUNT,
+) -> np.ndarray:
+    """Years from each observation to its contract's settlement on ``expiry``.
+
+    Whole days are ``day_count``'s year fraction from the observation's date to the
+    expiry date, so a bar at the close has exactly the snapshot's ``time_to(expiry)``.
+    The rest is the clock: from the bar's time to the settlement time -- the 16:00 ET
+    close for PM settlement, the open 6.5 hours earlier for AM -- as a fraction of one
+    day under the same day count. ``settlement`` holds :class:`Settlement` values.
+    """
+    local = pd.to_datetime(observed_at).dt.tz_convert(TIMEZONE)
+    start = local.dt.date
+    end = pd.Series([pd.Timestamp(d).date() for d in expiry], index=local.index)
+    whole = {(s, e): year_fraction(s, e, day_count) for s, e in set(zip(start, end))}
+    one_day = {s: year_fraction(s, s + dt.timedelta(days=1), day_count) for s in set(start)}
+
+    close = MARKET_CLOSE.hour + MARKET_CLOSE.minute / 60
+    settles = close - settlement.map(lambda s: Settlement(s).hours_before_close()).to_numpy(dtype=float)
+    clock = (local.dt.hour + local.dt.minute / 60 + local.dt.second / 3600).to_numpy(dtype=float)
+    return (
+        np.array([whole[key] for key in zip(start, end)], dtype=float)
+        + (settles - clock) / 24 * np.array([one_day[s] for s in start], dtype=float)
+    )
 
 
 def window_bars(
@@ -160,11 +194,18 @@ def window_bars(
 
     ``frame`` is the data pipeline's ``load_market`` output for ``product``'s
     underlying: one row per option per minute with a trade, joined to the
-    underlying's bar for that minute. ``day_count`` is the snapshot's, so ``T``
-    here is the snapshot's ``time_to``, less the hours an AM-settled option
-    gives up. Returns the bars -- ``timestamp, expiry, option_root, settlement,
-    right, strike, price, volume, spot, days, T`` -- and the count of bars
-    dropped, by reason. ``right`` is +1 for a call and -1 for a put.
+    underlying's bar for that minute. Returns the bars -- ``timestamp, expiry,
+    option_root, settlement, right, strike, price, volume, spot, days, T,
+    T_close`` -- and the count of bars dropped, by reason. ``right`` is +1 for a
+    call and -1 for a put.
+
+    Two times to settlement, both under the snapshot's ``day_count``:
+
+    * ``T`` from the bar's own minute (:func:`time_to_settlement`): what the bar's
+      price was paid for, so what its implied vol and its parity pair use;
+    * ``T_close`` from ``as_of``'s 16:00 close: the snapshot's ``time_to``, less
+      the hours an AM-settled option gives up, the same for every bar of an
+      expiry -- where the forwards and the surface sit.
 
     Where an AM-settled root and a PM-settled weekly share an expiry date (the
     third Friday), only the PM series is kept: they are different contracts
@@ -196,6 +237,7 @@ def window_bars(
     years = {d: year_fraction(as_of, d, day_count) for d in set(expiry)}
     one_day = year_fraction(as_of, as_of + dt.timedelta(days=1), day_count)
     early = settlement.map(lambda s: Settlement(s).hours_before_close() / 24.0 * one_day)
+    to_settlement = time_to_settlement(bars["option_timestamp"], expiry, settlement, day_count)
     out = pd.DataFrame(
         {
             "timestamp": bars["option_timestamp"],
@@ -208,9 +250,11 @@ def window_bars(
             "volume": bars["option_volume"].astype(float),
             "spot": bars["spot"].astype(float),
             "days": (expiry - as_of).map(lambda d: d.days).astype(int),
-            "T": expiry.map(years).to_numpy(dtype=float) - early.to_numpy(dtype=float),
+            "T": to_settlement,
+            "T_close": expiry.map(years).to_numpy(dtype=float) - early.to_numpy(dtype=float),
         }
     )
+    out = keep(out["T"] > 0, "at or past settlement", out)
     out = keep(out["days"] >= config.min_days, f"under {config.min_days} days to expiry", out)
     return out.reset_index(drop=True), drops
 
