@@ -79,13 +79,8 @@ It fetches:
 - dividends up to a year past `END`. Indices are skipped.
 
 Everything is cached under `market_data/` (git-ignored; one day of SPX options is large).
-Reruns fetch only what is missing. To fetch one dataset at a time, there are also:
-
-```bash
-python scripts/download_equity_data.py --dates 2026-09-10 --tickers SPX SPY
-python scripts/download_rates.py --start 2026-09-01 --end 2026-09-30 --provider massive
-python scripts/download_dividends.py --tickers SPY --start 2026-09-01 --end 2027-09-30
-```
+Reruns fetch only what is missing. To fetch one dataset at a time, set the others'
+`DOWNLOAD_EQUITY` / `DOWNLOAD_RATES` / `DOWNLOAD_DIVIDENDS` flags to `False`.
 
 ### 2. Run the app
 
@@ -119,7 +114,8 @@ should agree side by side: the rates, the forwards, and the call vs put implied 
 **Sidebar** (applies to both pages):
 - the underlying and the day, a calendar limited to the cached days;
 - the option roots, e.g. SPXW;
-- the minute window, 15:30–16:00 ET by default;
+- the minute window, from 15:30 to before 16:00 ET by default. The end is exclusive: the
+  16:00 bar holds trades after the index's closing print;
 - the Treasury provider and lag, and the flat dividend yield;
 - the moneyness band for the parity regression;
 - plot filters: days to expiry, minimum price and max |k|/√T.
@@ -155,11 +151,14 @@ app/
     day_overview.py
     expiry_drilldown.py
   analysis/            research computations taken from the notebook
-    parity.py          minute window, call/put pairs, the parity regression per expiry
-    implied_vols.py    time to settlement, curve forwards, implied vol per bar, filters
+    implied_vols.py    curve forwards, implied vol per bar, filters, call-put iv pairs
     rate_curves.py     zero / forward / par curve tables
     compare.py         the per-expiry table, and both parity lines for one expiry
 ```
+
+The window, the time to settlement and the parity regression come from the library
+(`torch_pricer.market.market_data.window_bars` and `torch_pricer.market.parity`), so the app
+looks at the same bars a snapshot is calibrated from.
 
 **Where code goes:**
 - Exploratory analysis used only by the app belongs in `app/analysis/`, not in the library.
@@ -186,8 +185,9 @@ app/
 | `instruments/spec.py`, `payoff.py` | Instrument specs as frozen dataclasses, and differentiable payoffs over simulated paths |
 | `instruments/listed.py` | `LISTED_PRODUCTS`: contract terms per underlying, i.e. option roots, AM/PM settlement and exercise style (SPX, SPY) |
 | `conventions.py` | Calendars and day counts. The only module that touches QuantLib |
-| `market/market_data.py` | What the market publishes: spot, option and rate quotes, kept apart from fitted objects |
-| `market/curve/` | The `Curve` interface; `treasury_zero_curve` (par → zero bootstrap); parity forwards and implied carry |
+| `market/market_data.py` | What the market publishes: spot, option and rate quotes, kept apart from fitted objects. `window_bars`: the observation window, with each bar's time to settlement (`T`, from its own minute; AM roots settle 6.5h early) |
+| `market/parity.py` | Put-call parity: same-minute pairs near the money, the minute-demeaned regression for r and q (`regress_parity`, `parity_fit`), and the forward per expiry (`parity_forwards`) |
+| `market/curve/` | The `Curve` interface; `treasury_zero_curve` (par → zero bootstrap); implied carry from the parity forwards |
 | `market/surface/` | The `VolSurface` interface in total variance `w(k, T)`; flat and SSVI surfaces; per-bar implied vols and `fit_surface` |
 | `market/build.py` | `build_snapshot`: one day of data → calibrated `MarketSnapshot`, with a record of every step |
 | `market/snapshot.py` | `MarketSnapshot`: the calibrated curves and surface, the only input to pricing |
@@ -214,8 +214,6 @@ Design choices that run through the library:
 
 ## Known issues
 
-- 15 tests in `tests/test_massive_loader.py` and `tests/test_coverage_and_download.py`
-  currently fail.
 - The app's analysis assumes European options and a flat dividend yield. For SPY (American,
   discrete dividends), the parity r and q and the call vs put gaps also reflect early
   exercise and dividends.
