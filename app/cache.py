@@ -22,6 +22,7 @@ import pandas as pd  # noqa: E402
 import streamlit as st  # noqa: E402
 
 import analysis  # noqa: E402
+from analysis import surface_models  # noqa: E402
 from data_pipeline import MassiveHistoricalDataLoader, RatesDataLoader, cached_days  # noqa: E402
 from torch_pricer.instruments.listed import LISTED_PRODUCTS, listed_product  # noqa: E402
 from torch_pricer.market import parity  # noqa: E402
@@ -29,6 +30,7 @@ from torch_pricer.market.curve import treasury_zero_curve  # noqa: E402
 from torch_pricer.market.market_data import QuoteConfig, window_bars  # noqa: E402
 
 SETTINGS_KEY, FILTERS_KEY, EXPIRY_KEY = "settings", "filters", "drill_expiry"
+FIT_KEY = "fit_settings"
 
 
 @dataclass(frozen=True)
@@ -160,12 +162,13 @@ def points(s: Settings, f: Filters, side: str = "both", combine: bool = False) -
 
 @st.cache_data(show_spinner=False, max_entries=16)
 def iv_pairs(s: Settings, f: Filters) -> pd.DataFrame:
-    return analysis.call_put_pairs(contract_vols(s, False), **f.kwargs())
+    return analysis.call_put_pairs(contract_vols(s, False), parity_fit(s)["discount"], **f.kwargs())
 
 
 @st.cache_data(show_spinner=False, max_entries=16)
 def iv_parity_by_expiry(s: Settings, f: Filters) -> pd.DataFrame:
-    return analysis.parity_by_expiry(iv_pairs(s, f))
+    by_expiry = analysis.parity_by_expiry(iv_pairs(s, f))
+    return by_expiry[by_expiry.n > 0].reset_index(drop=True)
 
 
 def near_the_money(pts: pd.DataFrame, band: float) -> pd.Series:
@@ -184,3 +187,78 @@ def expiry_table(s: Settings, f: Filters) -> pd.DataFrame:
 def expiry_parity_lines(s: Settings, expiry: date):
     pairs, fit = parity_pairs(s), parity_fit(s)
     return analysis.expiry_parity_lines(pairs[pairs.expiry == expiry], fit.loc[expiry], curve(s), s.dividend_yield)
+
+
+# -- surface models ----------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class FitSettings:
+    """What the surface-models page chose: which quotes go into a fit.
+
+    The forwards are always the sidebar's Treasury curve and flat q.
+    """
+
+    min_days: float = 7.0
+    min_price: float = 0.05
+    max_abs_k: float = 1.0
+    max_iter: int = 500
+
+    def quote_config(self, s: Settings) -> QuoteConfig:
+        return QuoteConfig(window_start=f"{s.window_start:%H:%M}", window_end=f"{s.window_end:%H:%M}",
+                           min_days=self.min_days, min_price=self.min_price, max_abs_k=self.max_abs_k)
+
+
+@st.cache_data(show_spinner="Building quotes and forwards for the fits...", max_entries=8)
+def fit_inputs(s: Settings, fs: FitSettings):
+    return surface_models.fit_inputs(window(s), curve(s), fs.quote_config(s), s.dividend_yield)
+
+
+@st.cache_resource(show_spinner=False, max_entries=24)
+def model_fit(s: Settings, fs: FitSettings, model: str):
+    """One model's fit. A resource, not data: the surface is a torch module, kept as is."""
+    return surface_models.fit_model(model, fit_inputs(s, fs), date.fromisoformat(s.day), fs.max_iter)
+
+
+def model_fits(s: Settings, fs: FitSettings, models: tuple[str, ...]):
+    return [model_fit(s, fs, m) for m in models]
+
+
+@st.cache_data(show_spinner=False, max_entries=16)
+def model_residuals(s: Settings, fs: FitSettings, models: tuple[str, ...]) -> pd.DataFrame:
+    return surface_models.residuals(model_fits(s, fs, models))
+
+
+@st.cache_data(show_spinner=False, max_entries=16)
+def smile_curves(s: Settings, fs: FitSettings, models: tuple[str, ...], expiries: tuple[date, ...]) -> pd.DataFrame:
+    return surface_models.smile_curves(model_fits(s, fs, models), model_residuals(s, fs, models), expiries)
+
+
+@st.cache_data(show_spinner=False, max_entries=16)
+def surface_mesh(s: Settings, fs: FitSettings, model: str, models: tuple[str, ...]) -> dict:
+    return surface_models.surface_mesh(model_fit(s, fs, model), model_residuals(s, fs, models))
+
+
+@st.cache_data(show_spinner=False, max_entries=16)
+def atm_term_structure(s: Settings, fs: FitSettings, models: tuple[str, ...]):
+    return surface_models.atm_term_structure(model_fits(s, fs, models), model_residuals(s, fs, models))
+
+
+@st.cache_data(show_spinner="Computing Dupire's local vol...", max_entries=16)
+def local_vol_grid(s: Settings, fs: FitSettings, model: str, models: tuple[str, ...]) -> dict:
+    return surface_models.local_vol_grid(model_fit(s, fs, model), model_residuals(s, fs, models))
+
+
+@st.cache_data(show_spinner=False, max_entries=16)
+def model_summary(s: Settings, fs: FitSettings, models: tuple[str, ...]) -> pd.DataFrame:
+    return surface_models.model_summary(model_fits(s, fs, models))
+
+
+@st.cache_data(show_spinner=False, max_entries=16)
+def per_expiry_errors(s: Settings, fs: FitSettings, models: tuple[str, ...]) -> pd.DataFrame:
+    return surface_models.per_expiry_errors(model_residuals(s, fs, models))
+
+
+@st.cache_data(show_spinner=False, max_entries=24)
+def parameter_table(s: Settings, fs: FitSettings, model: str):
+    fit = model_fit(s, fs, model)
+    return (*surface_models.parameter_table(fit), fit.surface.constraints())

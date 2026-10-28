@@ -3,9 +3,10 @@
 Run from the repo root: ``streamlit run app/streamlit_app.py``
 (``pip install -e .[app]`` for the dependencies).
 
-Two pages, each putting the rates, the forwards and the call vs put vols side by side:
-a day overview across expiries, and a drill-down into one expiry. The sidebar's choices
-apply to both. Computation lives in ``app/analysis`` and the library; pages only plot.
+Two pages put the rates, the forwards and the call vs put vols side by side: a day
+overview across expiries, and a drill-down into one expiry. A third sets the library's
+surface models against each other and against the quotes. The sidebar's choices apply
+to all three. Computation lives in ``app/analysis`` and the library; pages only plot.
 """
 
 from __future__ import annotations
@@ -21,6 +22,7 @@ st.set_page_config(page_title="Vol surface research", layout="wide")
 PAGES = [
     st.Page("pages/day_overview.py", title="Day overview", default=True),
     st.Page("pages/expiry_drilldown.py", title="Expiry drill-down"),
+    st.Page("pages/surface_models.py", title="Surface models"),
 ]
 
 

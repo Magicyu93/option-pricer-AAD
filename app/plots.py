@@ -88,8 +88,8 @@ def _pair_hover(pairs: pd.DataFrame) -> tuple[np.ndarray, str]:
         "%{customdata[0]} K=%{customdata[1]:.0f}, traded %{customdata[2]} ET, spot %{customdata[3]:.2f}<br>"
         "k=%{customdata[4]:.4f}, %{customdata[5]:.2f} days<br>"
         "call %{customdata[6]:.2f} (iv %{customdata[8]:.2f}%), put %{customdata[7]:.2f} (iv %{customdata[9]:.2f}%)<br>"
-        "iv gap %{customdata[10]:+.2f} vol pts, parity residual %{customdata[11]:+.2f}<br>"
-        "F %{customdata[12]:.2f} vs pair-implied %{customdata[13]:.2f}<extra></extra>"
+        "iv gap %{customdata[10]:+.2f} vol pts, residual vs Treasury + flat q %{customdata[11]:+.2f}<br>"
+        "F: Treasury + flat q %{customdata[12]:.2f}, parity %{customdata[13]:.2f}<extra></extra>"
     )
     return data.to_numpy(), template
 
@@ -177,7 +177,8 @@ def carry_vs_parity(expiries: pd.DataFrame, flat_q: float, zoom: bool) -> go.Fig
 
 
 def forward_error_by_expiry(by_expiry: pd.DataFrame) -> go.Figure:
-    """Median ``F - F_pair`` per expiry, with the middle half of the pairs as an error bar."""
+    """Median ``F - F_pair`` per expiry (Treasury + flat q forward minus the pair's forward at
+    the parity regression's D), with the middle half of the pairs as an error bar."""
     fig = go.Figure(go.Scatter(
         x=by_expiry.days, y=by_expiry.F_error_median, mode="markers",
         marker=_day_marker(by_expiry.days, by_expiry.days, showscale=False, size=9, line=dict(color="white", width=1)),
@@ -190,7 +191,7 @@ def forward_error_by_expiry(by_expiry: pd.DataFrame) -> go.Figure:
     fig.add_hline(y=0, line=dict(color=MUTED, width=1))
     fig.update_xaxes(**_log_days_axis(by_expiry.days))
     fig.update_yaxes(title_text="index points")
-    return _style(fig, "Forward error F − F_pair", 380)
+    return _style(fig, "Forward: Treasury + flat q − parity", 380)
 
 
 def iv_gap_vs_k(pairs: pd.DataFrame) -> go.Figure:
@@ -416,3 +417,171 @@ def iv_gap_by_minute(pairs: pd.DataFrame) -> go.Figure:
     fig.update_xaxes(title_text="strike K")
     fig.update_yaxes(title_text="call − put iv (vol points)")
     return _style(fig, f"Call − put iv by minute, {len(pairs)} pairs", 460)
+
+
+# -- page 3: surface models ----------------------------------------------------------------
+
+MODEL_COLORS = {"SSVI": ACCENT, "eSSVI": FORWARD_COLOR, "SVI": "#8a5cd1", "Flat": MUTED}
+ERROR_SCALE = "RdBu_r"  # model above the quote red, below blue
+
+
+def _model_color(model: str) -> str:
+    return MODEL_COLORS.get(model, MUTED)
+
+
+def _quote_hover(resid: pd.DataFrame) -> tuple[np.ndarray, str]:
+    """customdata and hovertemplate for one fitted quote: the market's iv and the model's."""
+    data = pd.DataFrame({
+        "model": resid.model, "expiry": resid.expiry.astype(str), "right": resid.option_type,
+        "strike": resid.strike, "k": resid.k, "days": resid.days, "iv": 100 * resid.iv,
+        "model_iv": 100 * resid.model_iv, "error": 100 * resid.error, "volume": resid.volume,
+    })
+    template = (
+        "%{customdata[1]} %{customdata[2]} K=%{customdata[3]:.0f}<br>"
+        "k=%{customdata[4]:.4f}, %{customdata[5]:.2f} days<br>"
+        "quote iv %{customdata[6]:.2f}%, %{customdata[0]} %{customdata[7]:.2f}% "
+        "(error %{customdata[8]:+.2f} vol pts)<br>volume in the window %{customdata[9]:.0f}<extra></extra>"
+    )
+    return data.to_numpy(), template
+
+
+def model_errors_by_expiry(per_expiry: pd.DataFrame) -> go.Figure:
+    """Each model's weighted RMSE (top) and mean error (bottom) per expiry."""
+    fig = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.08,
+                        subplot_titles=["RMSE per expiry", "Mean error (model − quote) per expiry"])
+    for model, part in per_expiry.groupby("model", sort=False):
+        part = part.sort_values("days")
+        custom = np.column_stack([part.expiry.astype(str), part.quotes, part.max_abs])
+        for row, col in ((1, "rmse"), (2, "bias")):
+            fig.add_trace(go.Scatter(
+                x=part.days, y=part[col], mode="lines+markers", name=model, legendgroup=model,
+                showlegend=row == 1, line=dict(color=_model_color(model), width=1.5), marker=dict(size=6),
+                customdata=custom,
+                hovertemplate=(f"{model} %{{customdata[0]}}, %{{customdata[1]:.0f}} quotes<br>{col} %{{y:.3f}} "
+                               "vol pts<br>largest error %{customdata[2]:.2f}<extra></extra>")), row=row, col=1)
+    fig.add_hline(y=0, line=dict(color=MUTED, width=1), row=2, col=1)
+    fig.update_xaxes(**_log_days_axis(per_expiry.days), row=2, col=1)
+    fig.update_xaxes(type="log", row=1, col=1)
+    fig.update_yaxes(title_text="vol points", rangemode="tozero", row=1, col=1)
+    fig.update_yaxes(title_text="vol points", row=2, col=1)
+    return _style(fig, "Fit error by expiry (weighted as in the fit)", 520)
+
+
+def surface_vs_quotes_3d(mesh: dict, resid: pd.DataFrame, model: str, log_days: bool, sticks: bool,
+                         color_by_error: bool) -> go.Figure:
+    """The fitted surface as a mesh, the quotes it was fitted to as points, and optionally
+    a segment from each quote to the surface whose length is the fit error."""
+    customdata, template = _quote_hover(resid)
+    fig = go.Figure(go.Surface(
+        x=mesh["k"], y=mesh["days"], z=100 * mesh["iv"], colorscale=EXPIRY_COLORSCALE, opacity=0.55,
+        showscale=False, name=f"{model} surface", showlegend=True,
+        hovertemplate=f"{model}<br>k=%{{x:.3f}}, %{{y:.1f}} days<br>iv %{{z:.2f}}%<extra></extra>",
+        contours=dict(x=dict(show=False), y=dict(show=True, color="white", width=1, highlight=False))))
+    if sticks:
+        nan = np.full(len(resid), np.nan)
+        fig.add_trace(go.Scatter3d(
+            x=np.column_stack([resid.k, resid.k, nan]).ravel(),
+            y=np.column_stack([resid.days, resid.days, nan]).ravel(),
+            z=np.column_stack([100 * resid.iv, 100 * resid.model_iv, nan]).ravel(),
+            mode="lines", line=dict(color=MUTED, width=2), name="quote − surface", hoverinfo="skip"))
+    if color_by_error:
+        bound = float(np.nanpercentile(np.abs(100 * resid.error), 98)) or 1.0
+        marker = dict(color=100 * resid.error, colorscale=ERROR_SCALE, cmin=-bound, cmax=bound, size=3,
+                      colorbar=dict(title="error<br>(vol pts)", len=0.6))
+    else:
+        marker = _day_marker(resid.days, resid.days, showscale=True, size=3)
+    fig.add_trace(go.Scatter3d(x=resid.k, y=resid.days, z=100 * resid.iv, mode="markers", name="quotes",
+                               marker=marker, customdata=customdata, hovertemplate=template))
+    ranges = pd.DataFrame({"k": np.concatenate([resid.k, mesh["k"].ravel()]),
+                           "days": np.concatenate([resid.days, mesh["days"].ravel()])})
+    fig.update_layout(scene=_scene(ranges, "iv", log_days))
+    return _style_3d(fig, f"{model} surface against the {len(resid):,} quotes it was fitted to", 700)
+
+
+def residuals_by_model(resid: pd.DataFrame, models: list[str]) -> go.Figure:
+    """Each quote's error against ``k / sqrt(T)``, one panel per model, coloured by days."""
+    fig = make_subplots(rows=1, cols=len(models), shared_yaxes=True, horizontal_spacing=0.03,
+                        subplot_titles=models)
+    for i, model in enumerate(models, start=1):
+        part = resid[resid.model == model]
+        customdata, template = _quote_hover(part)
+        fig.add_trace(go.Scattergl(
+            x=part.x, y=100 * part.error, mode="markers", name=model, showlegend=False,
+            marker=_day_marker(part.days, resid.days, showscale=i == len(models), size=5,
+                               symbol=np.where(part.option_type == "call", "diamond", "square")),
+            customdata=customdata, hovertemplate=template), row=1, col=i)
+        fig.add_hline(y=0, line=dict(color=MUTED, width=1), row=1, col=i)
+        fig.update_xaxes(title_text="k / sqrt(T)", row=1, col=i)
+    fig.update_yaxes(title_text="model − quote (vol points)", row=1, col=1)
+    return _style(fig, "Error per quote (call diamonds, put squares)", 420)
+
+
+def smile_grid(resid: pd.DataFrame, curves: pd.DataFrame, expiries: list, models: list[str],
+               cols: int = 4) -> go.Figure:
+    """One panel per expiry: the quotes as points, and each model's smile as a line."""
+    rows = -(-len(expiries) // cols)
+    quotes = resid[resid.model == models[0]]
+    titles = [f"{e:%Y-%m-%d} ({365 * quotes[quotes.expiry == e]['T'].iloc[0]:.0f}d)" for e in expiries]
+    fig = make_subplots(rows=rows, cols=cols, subplot_titles=titles, horizontal_spacing=0.05,
+                        vertical_spacing=0.32 / rows)
+    for i, expiry in enumerate(expiries):
+        r, c = i // cols + 1, i % cols + 1
+        part = quotes[quotes.expiry == expiry]
+        customdata, template = _quote_hover(part)
+        for right, symbol in (("call", "diamond"), ("put", "square")):
+            sel = (part.option_type == right).to_numpy()
+            fig.add_trace(go.Scattergl(
+                x=part.k[sel], y=100 * part.iv[sel], mode="markers", name=f"quote: {right}",
+                legendgroup=right, showlegend=i == 0,
+                marker=dict(color=POINT_COLOR, size=5, symbol=symbol, opacity=0.6),
+                customdata=customdata[sel], hovertemplate=template), row=r, col=c)
+        for model in models:
+            line = curves[(curves.expiry == expiry) & (curves.model == model)]
+            fig.add_trace(go.Scatter(
+                x=line.k, y=100 * line.iv, mode="lines", name=model, legendgroup=model, showlegend=i == 0,
+                line=dict(color=_model_color(model), width=2),
+                hovertemplate=f"{model}: k=%{{x:.3f}}, iv %{{y:.2f}}%<extra></extra>"), row=r, col=c)
+    fig.update_annotations(font_size=11)
+    fig.update_xaxes(title_text="k", title_standoff=2)
+    _style(fig, "Smiles: quotes and every model", 260 * rows + 90)
+    fig.update_layout(legend=dict(y=-0.25 / rows))
+    return fig
+
+
+def atm_term_structure(lines: pd.DataFrame, quotes: pd.DataFrame) -> go.Figure:
+    """ATM vol against days: the quotes' per expiry, and each model's between the expiries."""
+    fig = go.Figure()
+    for model, part in lines.groupby("model", sort=False):
+        fig.add_trace(go.Scatter(x=part.days, y=100 * part.iv, mode="lines", name=model,
+                                 line=dict(color=_model_color(model), width=2),
+                                 hovertemplate=f"{model}: %{{x:.1f}} days, ATM iv %{{y:.2f}}%<extra></extra>"))
+    fig.add_trace(go.Scatter(
+        x=quotes.days, y=100 * quotes.iv, mode="markers", name="quotes, at k = 0",
+        marker=dict(color=POINT_COLOR, size=7, line=dict(color="white", width=1)),
+        customdata=quotes.expiry.astype(str),
+        hovertemplate="%{customdata}: %{x:.1f} days, ATM iv %{y:.2f}%<extra></extra>"))
+    fig.update_xaxes(**_log_days_axis(lines.days))
+    fig.update_yaxes(title_text="ATM implied vol (%)")
+    return _style(fig, "ATM term structure, between the expiries too", 460)
+
+
+def local_vol_heatmap(grid: dict, model: str) -> go.Figure:
+    """Dupire's local vol over ``k / sqrt(T)`` and days; cells with negative local variance marked."""
+    vol = 100 * grid["vol"]
+    top = float(np.nanpercentile(vol, 98)) if np.isfinite(vol).any() else None  # spikes would wash out the rest
+    fig = go.Figure(go.Heatmap(
+        x=grid["x"], y=grid["days"], z=vol, colorscale="Viridis", zmin=0, zmax=top,
+        colorbar=dict(title="local vol (%)"), zsmooth=False,
+        hovertemplate="k/sqrt(T)=%{x:.2f}, %{y:.1f} days<br>local vol %{z:.2f}%<extra></extra>"))
+    neg_t, neg_x = np.nonzero(grid["variance"] < 0)
+    if len(neg_t):
+        fig.add_trace(go.Scatter(
+            x=grid["x"][neg_x], y=grid["days"][neg_t], mode="markers", name="negative local variance",
+            marker=dict(symbol="x", color=ACCENT, size=6),
+            customdata=grid["variance"][neg_t, neg_x],
+            hovertemplate="k/sqrt(T)=%{x:.2f}, %{y:.1f} days<br>local variance %{customdata:.3g}<extra></extra>"))
+    fig.update_xaxes(title_text="k / sqrt(T)")
+    fig.update_yaxes(**_log_days_axis(pd.Series(grid["days"])))
+    share = len(neg_t) / grid["variance"].size
+    note = f", negative on {share:.0%} of the grid" if len(neg_t) else ", non-negative everywhere"
+    return _style(fig, f"{model}: Dupire local vol{note}", 460)

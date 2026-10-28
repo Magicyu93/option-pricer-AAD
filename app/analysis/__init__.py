@@ -5,6 +5,7 @@ and a flat dividend yield, and the per-expiry comparison between them and what p
 parity implies. The window, the time to settlement and the parity regression are the
 library's (``torch_pricer.market.market_data`` and ``torch_pricer.market.parity``); what is
 here are research views, and the app pages only plot what these functions return.
+``surface_models`` sets the library's surface fits side by side.
 """
 
 from .compare import expiry_parity_lines, expiry_table
@@ -18,6 +19,7 @@ from .implied_vols import (
     select_points,
 )
 from .rate_curves import par_rates, rate_curve_table
+from . import surface_models
 
 __all__ = [
     "call_put_pairs",
@@ -31,4 +33,5 @@ __all__ = [
     "parity_by_expiry",
     "rate_curve_table",
     "select_points",
+    "surface_models",
 ]

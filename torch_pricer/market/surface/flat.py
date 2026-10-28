@@ -8,7 +8,7 @@ import torch
 import torch.nn as nn
 from torch import Tensor
 
-from torch_pricer.market.surface.base import VolSurface
+from torch_pricer.market.surface.base import SliceQuotes, VolSurface
 from torch_pricer.tensors import as_tensor
 
 
@@ -21,10 +21,10 @@ class FlatVolSurface(VolSurface):
         self._ref = as_of
 
     @classmethod
-    def initial(cls, expiry_times, atm_total_variance, as_of: dt.date) -> FlatVolSurface:
+    def initial(cls, slices: tuple[SliceQuotes, ...], as_of: dt.date) -> FlatVolSurface:
         """The median ATM vol across expiries."""
-        t = torch.as_tensor(expiry_times, dtype=torch.float64)
-        w = torch.as_tensor(atm_total_variance, dtype=torch.float64)
+        t = torch.tensor([q.expiry_time for q in slices], dtype=torch.float64)
+        w = torch.tensor([q.atm_total_variance for q in slices], dtype=torch.float64)
         surface = cls(float((w / t).sqrt().median()), as_of)
         return surface.to(torch.float64)
 

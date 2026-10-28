@@ -33,6 +33,9 @@ c2.plotly_chart(plots.carry_vs_parity(shown, s.dividend_yield, zoom), width="str
 
 # -- does parity hold --------------------------------------------------------------------
 st.subheader("Does parity hold?")
+st.caption("Forward gap: the Treasury + flat q forward minus each pair's parity forward K + (C − P) / D, with D "
+           "the parity regression's for that expiry, so each side uses its own discounting. Expiries without a "
+           "regression are left out.")
 pairs = cache.iv_pairs(s, f)
 c1, c2, c3 = st.columns(3)
 if pairs.empty:

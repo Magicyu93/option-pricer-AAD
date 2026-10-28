@@ -113,14 +113,19 @@ def near_the_money(points: pd.DataFrame, band: float = 0.05) -> pd.Series:
     return points.k.abs() <= band * np.sqrt(points["T"])
 
 
-def call_put_pairs(contract_vols: pd.DataFrame, **filters) -> pd.DataFrame:
+def call_put_pairs(contract_vols: pd.DataFrame, parity_discount: pd.Series, **filters) -> pd.DataFrame:
     """A call and a put at the same root, expiry, strike and minute, both passing the filters.
 
-    ``iv_gap = iv_call - iv_put`` in vol points; in index points
-    ``parity_residual = (C - P) - D (F - K)`` and ``F_error = F - F_pair`` with
-    ``F_pair = K + (C - P) / D``, F and D being the ones the ivs were computed with.
-    Per-minute rows only: a combined row averages a call and a put over different minutes,
-    so their gap would mix timing into parity.
+    ``iv_gap = iv_call - iv_put`` in vol points. Two sides, each with its own discount:
+
+    * Treasury + flat q, the F and D the ivs were computed with:
+      ``parity_residual = (C - P) - D (F - K)``;
+    * put-call parity, with ``parity_discount`` (the regression's D, indexed by expiry):
+      ``F_pair = K + (C - P) / D_parity``, NaN for an expiry with no regression.
+
+    ``F_error = F - F_pair`` compares the two forwards in index points. Per-minute rows
+    only: a combined row averages a call and a put over different minutes, so their gap
+    would mix timing into parity.
     """
     if not is_per_minute(contract_vols):
         raise ValueError("call_put_pairs needs per-minute rows: contract_vol_summary(..., combine=False)")
@@ -134,15 +139,17 @@ def call_put_pairs(contract_vols: pd.DataFrame, **filters) -> pd.DataFrame:
     pairs["iv_gap"] = 100 * (pairs.iv_call - pairs.iv_put)
     pairs["parity"] = pairs.price_call - pairs.price_put
     pairs["parity_residual"] = pairs.parity - pairs.discount * (pairs.forward - pairs.strike)
-    pairs["F_pair"] = pairs.strike + pairs.parity / pairs.discount
-    pairs["F_error"] = pairs.forward - pairs.F_pair  # = -parity_residual / D
+    pairs["parity_discount"] = pairs.expiry.map(parity_discount)
+    pairs["F_pair"] = pairs.strike + pairs.parity / pairs.parity_discount
+    pairs["F_error"] = pairs.forward - pairs.F_pair
     return pairs.sort_values(["expiry", "strike", "timestamp"], ignore_index=True)
 
 
 def parity_by_expiry(pairs: pd.DataFrame) -> pd.DataFrame:
-    """Per expiry of :func:`call_put_pairs`: the pair count, mean days, the average
-    ``discount`` and ``forward`` (the line ``D (F - K)``), and the median and middle half
-    (25%-75%) of ``F_error`` and ``parity_residual``."""
+    """Per expiry of :func:`call_put_pairs`: the pairs with an ``F_pair``, mean days, the
+    average ``discount`` and ``forward`` (the line ``D (F - K)``), and the median and middle
+    half (25%-75%) of ``F_error`` and ``parity_residual``. Expiries with no parity regression
+    have no ``F_error``; the caller drops them."""
     def q25(s):
         return s.quantile(0.25)
 
@@ -150,7 +157,7 @@ def parity_by_expiry(pairs: pd.DataFrame) -> pd.DataFrame:
         return s.quantile(0.75)
 
     return pairs.groupby(["option_root", "expiry"]).agg(
-        n=("F_error", "size"), days=("days", "mean"),
+        n=("F_error", "count"), days=("days", "mean"),
         discount=("discount", "mean"), forward=("forward", "mean"),
         F_error_median=("F_error", "median"), F_error_q25=("F_error", q25), F_error_q75=("F_error", q75),
         residual_median=("parity_residual", "median"), residual_q25=("parity_residual", q25),

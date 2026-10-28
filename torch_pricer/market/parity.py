@@ -1,11 +1,12 @@
-"""Put-call parity on traded minute bars: the pairs, the regression, and the forwards.
+"""Put-call parity on traded minute bars: the pairs and the regression. A diagnostic only.
 
 For a European call and put on the same strike and expiry,
 ``C - P = D (F - K) = A_t - D K`` with ``D = exp(-r T)`` and ``A_t = S_t exp(-q T)``.
-Every strike where both traded gives a forward ``F = K + (C - P) / D`` -- with no model
-and no dividend forecast. That is how a snapshot leaves dividends out without getting
-them wrong: whatever the market expects the index to pay is already in ``F``, and the
-*implied carry* ``q(T) = r(T) - ln(F/S) / T`` stands in for the dividend curve.
+The ``r`` and ``q`` that parity implies on trade prints are too noisy to build on --
+for short expiries ``q`` is a forward error of a point or two divided by a tiny ``T`` --
+so nothing here is an input to a snapshot or a model, whose forwards come from the
+discount and dividend curves (:func:`~torch_pricer.market.curve.calibration.curve_forwards`).
+This module measures how far those curves sit from what the trades imply.
 
 Trades are not simultaneous, and the index moves, so a call and a put only make a pair
 when they traded in the same minute, and each minute has its own intercept ``A_t``.
@@ -13,21 +14,12 @@ Pairs are kept within a moneyness band of that minute's spot -- far-wing prints 
 stale -- and only in minutes with two or more strikes, since one strike cannot separate
 the intercept from the slope.
 
-Two uses of the pairs:
-
-* :func:`regress_parity` -- ``D`` estimated from the trades alone: OLS of ``C - P`` on
-  ``K`` with one intercept per minute, by demeaning within each minute,
-  ``-D = sum(K_dm * P_dm) / sum(K_dm^2)``. Then ``r = -ln(D) / T`` and
-  ``q = -ln(A_t / S_t) / T``. A diagnostic of the discount curve and the carry; noisy
-  for short expiries, where ``D`` is close to 1 and the slope says little about ``r``.
-* :func:`parity_forwards` -- the forward per expiry with ``D`` from the discount curve,
-  the same ``D`` the snapshot prices with: each minute's average ``(C - P + D K) / D``
-  against that minute's spot. Expiries with too few pairs -- most long-dated ones, where
-  calls barely trade -- take their carry from the expiries that have them.
-
-Every pair uses its bar's own ``T`` (time from the minute to settlement); the forwards
-are reported at the close, ``T_close``, by holding each expiry's growth rate
-``ln(F/S) / T`` fixed.
+:func:`regress_parity` estimates ``D`` from the trades alone: OLS of ``C - P`` on ``K``
+with one intercept per minute, by demeaning within each minute,
+``-D = sum(K_dm * P_dm) / sum(K_dm^2)``. Then ``r = -ln(D) / T`` and
+``q = -ln(A_t / S_t) / T``. Noisy for short expiries, where ``D`` is close to 1 and the
+slope says little about ``r``. Every pair uses its bar's own ``T`` (time from the minute
+to settlement).
 
 Box-spread prints -- two strikes in a minute, all four legs with the same volume -- are
 flagged ``is_box``: traded as one package, they price the box financing rate, which runs
@@ -39,12 +31,8 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 
-from torch_pricer.errors import MarketDataError
-from torch_pricer.market.curve.base import Curve
-
 #: Keep pairs with ``|K / S - 1|`` below this: far-wing trade prints are stale.
 MONEYNESS_BAND = 0.10
-FORWARD_COLUMNS = ["expiry", "T", "discount", "ratio", "forward", "n_pairs", "source"]
 PAIR_COLUMNS = [
     "expiry", "timestamp", "option_root", "strike", "call", "put", "call_volume", "put_volume",
     "spot", "days", "T", "T_close", "parity", "is_box",
@@ -147,76 +135,3 @@ def parity_fit(pairs: pd.DataFrame) -> pd.DataFrame:
     fit["option_root"] = pairs.groupby("expiry")["option_root"].first()
     fit["days"] = fit["T"] * 365
     return fit.sort_values("T")
-
-
-def parity_forwards(
-    bars: pd.DataFrame,
-    curve: Curve,
-    spot: float,
-    *,
-    moneyness_band: float = MONEYNESS_BAND,
-    min_pairs: int = 2,
-    pairs: pd.DataFrame | None = None,
-) -> pd.DataFrame:
-    """One forward per expiry in ``bars``, at the close and the reference ``spot``.
-
-    ``bars`` is :func:`~torch_pricer.market.market_data.window_bars` output; ``pairs``,
-    if given, is :func:`parity_pairs` output for the same bars, so the pairs a caller
-    displays are exactly the ones used here. Each pair's forward uses the curve's ``D``
-    at the pair's own ``T``; each minute's forwards are averaged into a growth rate
-    ``ln(F/S) / T``, and the expiry's rate is the mean over its minutes.
-
-    Returns ``FORWARD_COLUMNS``, with ``T`` the expiry's ``T_close``, ``ratio = F/S``
-    and ``source`` either ``"parity"`` or ``"interpolated"``. Raises
-    :class:`MarketDataError` if no expiry has ``min_pairs`` pairs, since then there is
-    nothing to interpolate from.
-    """
-    if pairs is None:
-        pairs = parity_pairs(bars, moneyness_band)
-    expiries = (
-        bars.groupby("expiry", as_index=False)["T_close"].first()
-        .rename(columns={"T_close": "T"}).sort_values("T")
-    )
-    expiries["discount"] = curve.discount(expiries["T"].to_numpy()).detach().numpy()
-
-    discount = curve.discount(pairs["T"].to_numpy()).detach().numpy()
-    forward = pairs["strike"] + pairs["parity"] / discount
-    by_minute = pairs.assign(forward=forward).groupby(_BY_MINUTE).agg(
-        forward=("forward", "mean"), spot=("spot", "first"), T=("T", "first"), n=("strike", "size"),
-    )
-    by_minute["growth"] = np.log(by_minute["forward"] / by_minute["spot"]) / by_minute["T"]
-    parity = by_minute.groupby("expiry").agg(growth=("growth", "mean"), n_pairs=("n", "sum"))
-    parity = parity[parity["n_pairs"] >= min_pairs].reset_index()
-    if parity.empty:
-        raise MarketDataError(f"no expiry has {min_pairs} same-minute call/put pairs")
-
-    out = expiries.merge(parity, on="expiry", how="left")
-    out["source"] = np.where(out["growth"].notna(), "parity", "interpolated")
-    out["n_pairs"] = out["n_pairs"].fillna(0).astype(int)
-
-    # ln(F/S) interpolated linearly in T is a carry rate held piecewise constant;
-    # beyond the parity expiries, hold the nearest one's rate flat.
-    known = out[out["source"] == "parity"]
-    log_ratio = np.interp(out["T"], known["T"], known["growth"] * known["T"])
-    log_ratio = np.where(out["T"] < known["T"].iloc[0], known["growth"].iloc[0] * out["T"], log_ratio)
-    log_ratio = np.where(out["T"] > known["T"].iloc[-1], known["growth"].iloc[-1] * out["T"], log_ratio)
-    out["ratio"] = np.where(out["growth"].notna(), np.exp(out["growth"] * out["T"]), np.exp(log_ratio))
-    out["forward"] = spot * out["ratio"]
-    return out[FORWARD_COLUMNS].reset_index(drop=True)
-
-
-def parity_residuals(pairs: pd.DataFrame, forwards: pd.DataFrame, curve: Curve) -> pd.DataFrame:
-    """Each pair's ``C - P`` against the line its expiry's forward implies.
-
-    At the pair's minute the forward is that minute's spot grown at the expiry's rate,
-    ``F = S exp(T ln(ratio) / T_close)``, and the line is ``D(T) (F - K)``;
-    ``residual`` is how far the traded ``C - P`` sits from it, in premium.
-    """
-    fwd = forwards.set_index("expiry")
-    growth = np.log(fwd.loc[pairs["expiry"], "ratio"].to_numpy()) / fwd.loc[pairs["expiry"], "T"].to_numpy()
-    out = pairs.copy()
-    out["discount"] = curve.discount(out["T"].to_numpy()).detach().numpy()
-    out["expiry_forward"] = out["spot"].to_numpy() * np.exp(growth * out["T"].to_numpy())
-    out["fitted"] = out["discount"] * (out["expiry_forward"] - out["strike"])
-    out["residual"] = out["parity"] - out["fitted"]
-    return out
