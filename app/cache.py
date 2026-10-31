@@ -22,18 +22,22 @@ import pandas as pd  # noqa: E402
 import streamlit as st  # noqa: E402
 
 import analysis  # noqa: E402
+from analysis import surface_models  # noqa: E402
 from data_pipeline import MassiveHistoricalDataLoader, RatesDataLoader, cached_days  # noqa: E402
 from torch_pricer.instruments.listed import LISTED_PRODUCTS, listed_product  # noqa: E402
 from torch_pricer.market import parity  # noqa: E402
+from torch_pricer.errors import MarketDataError  # noqa: E402
 from torch_pricer.market.curve import treasury_zero_curve  # noqa: E402
+from torch_pricer.market.curve.calibration import implied_dividend_curve  # noqa: E402
 from torch_pricer.market.market_data import QuoteConfig, window_bars  # noqa: E402
 
 SETTINGS_KEY, FILTERS_KEY, EXPIRY_KEY = "settings", "filters", "drill_expiry"
+FIT_KEY = "fit_settings"
 
 
 @dataclass(frozen=True)
 class Settings:
-    """What the sidebar chose: one day, one window, one rate curve and dividend yield."""
+    """What the sidebar chose: one day, the ivs' window, the rate curve, and the parity pairs."""
 
     ticker: str
     day: str
@@ -42,8 +46,8 @@ class Settings:
     window_end: time
     rates_provider: str
     rates_lag_days: int
-    dividend_yield: float
-    moneyness_band: float
+    parity: parity.ParityConfig  # which pairs set the forwards, over their own window
+    moneyness_band: float  # the parity regression's, a diagnostic
 
 
 @dataclass(frozen=True)
@@ -71,7 +75,8 @@ def filters() -> Filters:
 def caption(s: Settings) -> None:
     st.caption(
         f"{s.ticker} {', '.join(s.roots)} on {s.day} · bars {s.window_start:%H:%M} to before {s.window_end:%H:%M} ET · "
-        f"Treasury ({s.rates_provider}, lag {s.rates_lag_days}d) · flat q = {s.dividend_yield:.2%}"
+        f"Treasury ({s.rates_provider}, lag {s.rates_lag_days}d) · forwards from put-call parity, close pairs from "
+        f"{s.parity.close_start}" + (f", filled from {s.parity.fill_start}" if s.parity.fill_start else "")
     )
 
 
@@ -129,7 +134,57 @@ def window(s: Settings) -> pd.DataFrame:
     return bars[bars.option_root.isin(s.roots)].reset_index(drop=True)
 
 
-# -- put-call parity regression ----------------------------------------------------------
+# -- forwards: put-call parity at the Treasury discount -----------------------------------
+
+@st.cache_data(show_spinner="Loading the parity window...", max_entries=8)
+def parity_window(s: Settings) -> pd.DataFrame:
+    """The library's ``window_bars`` over the parity window, for the chosen roots."""
+    config = QuoteConfig(window_start=s.parity.data_start, window_end=s.parity.window_end, min_days=0, min_price=0.0)
+    bars, _ = window_bars(market(s.ticker, s.day), date.fromisoformat(s.day), listed_product(s.ticker), config)
+    return bars[bars.option_root.isin(s.roots)].reset_index(drop=True)
+
+
+@st.cache_data(show_spinner="Matching call/put pairs for the forwards...", max_entries=8)
+def forward_pairs(s: Settings) -> pd.DataFrame:
+    return parity.forward_pairs(parity_window(s), curve(s), s.parity)
+
+
+@st.cache_data(show_spinner=False, max_entries=8)
+def parity_forwards(s: Settings) -> pd.DataFrame:
+    return parity.parity_forwards(forward_pairs(s), s.parity)
+
+
+@st.cache_resource(show_spinner=False, max_entries=8)
+def dividend_curve(s: Settings):
+    """The library's dividend curve through the parity forwards: every page's forwards."""
+    return implied_dividend_curve(parity_forwards(s))
+
+
+def require_forwards(s: Settings) -> None:
+    """Stop the page with the reason when the day has no parity forwards to build on."""
+    try:
+        dividend_curve(s)
+    except MarketDataError as exc:
+        st.error(f"No forwards for {s.day}: {exc}. Loosen the parity filters in the sidebar.")
+        st.stop()
+
+
+@st.cache_data(show_spinner=False, max_entries=8)
+def filter_funnel(s: Settings) -> pd.DataFrame:
+    return analysis.filter_funnel(forward_pairs(s))
+
+
+@st.cache_data(show_spinner=False, max_entries=16)
+def implied_dividends(s: Settings, f: Filters):
+    return analysis.implied_dividends(parity_forwards(s), dividend_curve(s), expiry_table(s, f))
+
+
+@st.cache_data(show_spinner=False, max_entries=16)
+def intraday_forward(s: Settings, expiry: date):
+    return analysis.intraday_forward(forward_pairs(s), expiry, curve(s), dividend_curve(s))
+
+
+# -- put-call parity regression: a diagnostic ----------------------------------------------
 
 @st.cache_data(show_spinner="Matching call/put pairs...", max_entries=8)
 def parity_pairs(s: Settings) -> pd.DataFrame:
@@ -145,7 +200,7 @@ def parity_fit(s: Settings) -> pd.DataFrame:
 
 @st.cache_data(show_spinner="Inverting implied vols...", max_entries=8)
 def implied_vols(s: Settings) -> pd.DataFrame:
-    return analysis.contract_implied_vols(window(s), curve(s), s.dividend_yield)
+    return analysis.contract_implied_vols(window(s), curve(s), dividend_curve(s))
 
 
 @st.cache_data(show_spinner=False, max_entries=8)
@@ -165,7 +220,8 @@ def iv_pairs(s: Settings, f: Filters) -> pd.DataFrame:
 
 @st.cache_data(show_spinner=False, max_entries=16)
 def iv_parity_by_expiry(s: Settings, f: Filters) -> pd.DataFrame:
-    return analysis.parity_by_expiry(iv_pairs(s, f))
+    by_expiry = analysis.parity_by_expiry(iv_pairs(s, f))
+    return by_expiry[by_expiry.n > 0].reset_index(drop=True)
 
 
 def near_the_money(pts: pd.DataFrame, band: float) -> pd.Series:
@@ -177,10 +233,85 @@ def near_the_money(pts: pd.DataFrame, band: float) -> pd.Series:
 @st.cache_data(show_spinner=False, max_entries=16)
 def expiry_table(s: Settings, f: Filters) -> pd.DataFrame:
     return analysis.expiry_table(parity_pairs(s), parity_fit(s), iv_pairs(s, f), points(s, f), curve(s),
-                                 s.dividend_yield)
+                                 dividend_curve(s), parity_forwards(s))
 
 
 @st.cache_data(show_spinner=False, max_entries=16)
 def expiry_parity_lines(s: Settings, expiry: date):
     pairs, fit = parity_pairs(s), parity_fit(s)
-    return analysis.expiry_parity_lines(pairs[pairs.expiry == expiry], fit.loc[expiry], curve(s), s.dividend_yield)
+    return analysis.expiry_parity_lines(pairs[pairs.expiry == expiry], fit.loc[expiry], curve(s), dividend_curve(s))
+
+
+# -- surface models ----------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class FitSettings:
+    """What the surface-models page chose: which quotes go into a fit.
+
+    The forwards are always the sidebar's: the Treasury curve and the parity dividend curve.
+    """
+
+    min_days: float = 7.0
+    min_price: float = 0.05
+    max_abs_k: float = 1.0
+    max_iter: int = 500
+
+    def quote_config(self, s: Settings) -> QuoteConfig:
+        return QuoteConfig(window_start=f"{s.window_start:%H:%M}", window_end=f"{s.window_end:%H:%M}",
+                           min_days=self.min_days, min_price=self.min_price, max_abs_k=self.max_abs_k)
+
+
+@st.cache_data(show_spinner="Building quotes and forwards for the fits...", max_entries=8)
+def fit_inputs(s: Settings, fs: FitSettings):
+    return surface_models.fit_inputs(window(s), curve(s), fs.quote_config(s), dividend_curve(s))
+
+
+@st.cache_resource(show_spinner=False, max_entries=24)
+def model_fit(s: Settings, fs: FitSettings, model: str):
+    """One model's fit. A resource, not data: the surface is a torch module, kept as is."""
+    return surface_models.fit_model(model, fit_inputs(s, fs), date.fromisoformat(s.day), fs.max_iter)
+
+
+def model_fits(s: Settings, fs: FitSettings, models: tuple[str, ...]):
+    return [model_fit(s, fs, m) for m in models]
+
+
+@st.cache_data(show_spinner=False, max_entries=16)
+def model_residuals(s: Settings, fs: FitSettings, models: tuple[str, ...]) -> pd.DataFrame:
+    return surface_models.residuals(model_fits(s, fs, models))
+
+
+@st.cache_data(show_spinner=False, max_entries=16)
+def smile_curves(s: Settings, fs: FitSettings, models: tuple[str, ...], expiries: tuple[date, ...]) -> pd.DataFrame:
+    return surface_models.smile_curves(model_fits(s, fs, models), model_residuals(s, fs, models), expiries)
+
+
+@st.cache_data(show_spinner=False, max_entries=16)
+def surface_mesh(s: Settings, fs: FitSettings, model: str, models: tuple[str, ...]) -> dict:
+    return surface_models.surface_mesh(model_fit(s, fs, model), model_residuals(s, fs, models))
+
+
+@st.cache_data(show_spinner=False, max_entries=16)
+def atm_term_structure(s: Settings, fs: FitSettings, models: tuple[str, ...]):
+    return surface_models.atm_term_structure(model_fits(s, fs, models), model_residuals(s, fs, models))
+
+
+@st.cache_data(show_spinner="Computing Dupire's local vol...", max_entries=16)
+def local_vol_grid(s: Settings, fs: FitSettings, model: str, models: tuple[str, ...]) -> dict:
+    return surface_models.local_vol_grid(model_fit(s, fs, model), model_residuals(s, fs, models))
+
+
+@st.cache_data(show_spinner=False, max_entries=16)
+def model_summary(s: Settings, fs: FitSettings, models: tuple[str, ...]) -> pd.DataFrame:
+    return surface_models.model_summary(model_fits(s, fs, models))
+
+
+@st.cache_data(show_spinner=False, max_entries=16)
+def per_expiry_errors(s: Settings, fs: FitSettings, models: tuple[str, ...]) -> pd.DataFrame:
+    return surface_models.per_expiry_errors(model_residuals(s, fs, models))
+
+
+@st.cache_data(show_spinner=False, max_entries=24)
+def parameter_table(s: Settings, fs: FitSettings, model: str):
+    fit = model_fit(s, fs, model)
+    return (*surface_models.parameter_table(fit), fit.surface.constraints())

@@ -21,7 +21,7 @@ from torch_pricer.instruments.spec import (
     Style,
     VanillaOption,
 )
-from torch_pricer.market.curves import RateCurve
+from torch_pricer.market.curve.curves import RateCurve
 from torch_pricer.market.snapshot import MarketSnapshot
 from torch_pricer.models.black import BlackScholesModel
 from torch_pricer.pricer.engine import MCConfig, price
@@ -169,11 +169,9 @@ def test_snapshot_repr_works(market):
 
 
 def test_unimplemented_things_raise_rather_than_return():
-    from torch_pricer.black_formula import implied_vol
+    # implied_vol was here until it was implemented; see tests/test_implied_vol.py.
     from torch_pricer.simulator.brownian_bridge import BrownianBridge
 
-    with pytest.raises(NotImplementedError):
-        implied_vol(1.0, 100.0, 100.0, 1.0)
     with pytest.raises(NotImplementedError):
         BrownianBridge(0.0, 0.2).drift_coefficient(torch.zeros(2, 1), torch.tensor(0.0))
     with pytest.raises(NotImplementedError):

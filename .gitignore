@@ -32,4 +32,7 @@ htmlcov/
 .ipynb_checkpoints/
 
 # Massive flat-file cache (raw .csv.gz + parquet); regenerated on demand
-massive_data/market_data/
+market_data/
+
+# Local design notes and logs; kept out of the repo
+docs/

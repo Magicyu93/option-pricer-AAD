@@ -1,33 +1,30 @@
-"""Put-call parity on traded minute bars: the pairs, the regression, and the forwards.
+"""Put-call parity on traded minute bars: the forwards, and a regression kept as a diagnostic.
 
 For a European call and put on the same strike and expiry,
-``C - P = D (F - K) = A_t - D K`` with ``D = exp(-r T)`` and ``A_t = S_t exp(-q T)``.
-Every strike where both traded gives a forward ``F = K + (C - P) / D`` -- with no model
-and no dividend forecast. That is how a snapshot leaves dividends out without getting
-them wrong: whatever the market expects the index to pay is already in ``F``, and the
-*implied carry* ``q(T) = r(T) - ln(F/S) / T`` stands in for the dividend curve.
+``C - P = D (F - K)`` with ``D = exp(-r T)``. Given ``D``, every same-minute pair is a
+forward, ``F = K + (C - P) / D``.
+
+**The forwards** (:func:`forward_pairs`, :func:`parity_forwards`) take ``D`` from the
+discount curve -- Treasuries -- never from the trades: backing ``r`` out of parity is far
+too noisy at short expiries. Near the money the choice of ``D`` barely matters, since
+an error in it moves the forward by ``(F - K) dD / D``. Which pairs count is set by
+:class:`ParityConfig`, every filter a named field; :func:`forward_pairs` labels each pair
+with the filter that drops it. Each expiry's forward is then one robust number with a
+standard error, in cumulative carry ``y = -ln(F D / S)``, ready for
+:func:`~torch_pricer.market.curve.calibration.implied_dividend_curve`.
 
 Trades are not simultaneous, and the index moves, so a call and a put only make a pair
-when they traded in the same minute, and each minute has its own intercept ``A_t``.
-Pairs are kept within a moneyness band of that minute's spot -- far-wing prints are
-stale -- and only in minutes with two or more strikes, since one strike cannot separate
-the intercept from the slope.
+when they traded in the same minute, each marked against that minute's spot and time to
+settlement. The forward drifts during the day relative to spot, so late pairs set an
+expiry's forward (the *close* tier) and earlier ones only fill expiries without late
+pairs (the *day* tier), with a wider standard error.
 
-Two uses of the pairs:
-
-* :func:`regress_parity` -- ``D`` estimated from the trades alone: OLS of ``C - P`` on
-  ``K`` with one intercept per minute, by demeaning within each minute,
-  ``-D = sum(K_dm * P_dm) / sum(K_dm^2)``. Then ``r = -ln(D) / T`` and
-  ``q = -ln(A_t / S_t) / T``. A diagnostic of the discount curve and the carry; noisy
-  for short expiries, where ``D`` is close to 1 and the slope says little about ``r``.
-* :func:`parity_forwards` -- the forward per expiry with ``D`` from the discount curve,
-  the same ``D`` the snapshot prices with: each minute's average ``(C - P + D K) / D``
-  against that minute's spot. Expiries with too few pairs -- most long-dated ones, where
-  calls barely trade -- take their carry from the expiries that have them.
-
-Every pair uses its bar's own ``T`` (time from the minute to settlement); the forwards
-are reported at the close, ``T_close``, by holding each expiry's growth rate
-``ln(F/S) / T`` fixed.
+**The regression** (:func:`parity_pairs`, :func:`regress_parity`, :func:`parity_fit`)
+estimates ``D`` and the intercept from the trades alone: OLS of ``C - P`` on ``K`` with one
+intercept per minute, by demeaning within each minute,
+``-D = sum(K_dm * P_dm) / sum(K_dm^2)``. Then ``r = -ln(D) / T`` and
+``q = -ln(A_t / S_t) / T``. A diagnostic only: it shows how far the Treasury curve sits
+from what the trades imply, and is never an input.
 
 Box-spread prints -- two strikes in a minute, all four legs with the same volume -- are
 flagged ``is_box``: traded as one package, they price the box financing rate, which runs
@@ -36,20 +33,45 @@ above T-bills.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+
 import numpy as np
 import pandas as pd
 
-from torch_pricer.errors import MarketDataError
 from torch_pricer.market.curve.base import Curve
+from torch_pricer.market.market_data import TIMEZONE
 
 #: Keep pairs with ``|K / S - 1|`` below this: far-wing trade prints are stale.
 MONEYNESS_BAND = 0.10
-FORWARD_COLUMNS = ["expiry", "T", "discount", "ratio", "forward", "n_pairs", "source"]
 PAIR_COLUMNS = [
     "expiry", "timestamp", "option_root", "strike", "call", "put", "call_volume", "put_volume",
     "spot", "days", "T", "T_close", "parity", "is_box",
 ]
 _BY_MINUTE = ["expiry", "timestamp"]
+
+
+def _same_minute_pairs(bars: pd.DataFrame) -> pd.DataFrame:
+    """Every call and put at the same expiry, strike and minute, with ``parity = C - P``."""
+    keys = ["expiry", "timestamp", "strike"]
+    shared = ["option_root", "spot", "days", "T", "T_close"]
+    calls = bars.loc[bars["right"] > 0, [*keys, *shared, "price", "volume"]]
+    puts = bars.loc[bars["right"] < 0, [*keys, "price", "volume"]]
+    pairs = calls.merge(puts, on=keys, suffixes=("_call", "_put")).rename(columns={
+        "price_call": "call", "price_put": "put", "volume_call": "call_volume", "volume_put": "put_volume",
+    })
+    pairs["parity"] = pairs["call"] - pairs["put"]
+    return pairs
+
+
+def _is_box(pairs: pd.DataFrame) -> pd.Series:
+    """Two strikes in a minute, all four legs with one volume: a box traded as a package."""
+    grouped = pairs.groupby(_BY_MINUTE)
+    one_volume = (
+        (pairs["call_volume"] == pairs["put_volume"])
+        & (grouped["call_volume"].transform("nunique") == 1)
+        & (grouped["put_volume"].transform("nunique") == 1)
+    )
+    return (grouped["strike"].transform("size") == 2) & one_volume
 
 
 def parity_pairs(bars: pd.DataFrame, moneyness_band: float = MONEYNESS_BAND) -> pd.DataFrame:
@@ -59,24 +81,11 @@ def parity_pairs(bars: pd.DataFrame, moneyness_band: float = MONEYNESS_BAND) -> 
     per pair, ``parity = C - P``, keeping only minutes of an expiry with two or more
     strikes. Columns are ``PAIR_COLUMNS``.
     """
-    keys = ["expiry", "timestamp", "strike"]
-    shared = ["option_root", "spot", "days", "T", "T_close"]
-    calls = bars.loc[bars["right"] > 0, [*keys, *shared, "price", "volume"]]
-    puts = bars.loc[bars["right"] < 0, [*keys, "price", "volume"]]
-    pairs = calls.merge(puts, on=keys, suffixes=("_call", "_put")).rename(columns={
-        "price_call": "call", "price_put": "put", "volume_call": "call_volume", "volume_put": "put_volume",
-    })
-    pairs["parity"] = pairs["call"] - pairs["put"]
+    pairs = _same_minute_pairs(bars)
     pairs = pairs[(pairs["strike"] / pairs["spot"] - 1).abs() < moneyness_band]
     pairs = pairs[pairs.groupby(_BY_MINUTE)["strike"].transform("size") >= 2].copy()
 
-    grouped = pairs.groupby(_BY_MINUTE)
-    one_volume = (
-        (pairs["call_volume"] == pairs["put_volume"])
-        & (grouped["call_volume"].transform("nunique") == 1)
-        & (grouped["put_volume"].transform("nunique") == 1)
-    )
-    pairs["is_box"] = (grouped["strike"].transform("size") == 2) & one_volume
+    pairs["is_box"] = _is_box(pairs)
     return pairs[PAIR_COLUMNS].sort_values(["expiry", "timestamp", "strike"]).reset_index(drop=True)
 
 
@@ -149,74 +158,187 @@ def parity_fit(pairs: pd.DataFrame) -> pd.DataFrame:
     return fit.sort_values("T")
 
 
-def parity_forwards(
-    bars: pd.DataFrame,
-    curve: Curve,
-    spot: float,
-    *,
-    moneyness_band: float = MONEYNESS_BAND,
-    min_pairs: int = 2,
-    pairs: pd.DataFrame | None = None,
-) -> pd.DataFrame:
-    """One forward per expiry in ``bars``, at the close and the reference ``spot``.
+# -- forwards: Treasury discount, one robust forward per expiry ----------------------------
 
-    ``bars`` is :func:`~torch_pricer.market.market_data.window_bars` output; ``pairs``,
-    if given, is :func:`parity_pairs` output for the same bars, so the pairs a caller
-    displays are exactly the ones used here. Each pair's forward uses the curve's ``D``
-    at the pair's own ``T``; each minute's forwards are averaged into a growth rate
-    ``ln(F/S) / T``, and the expiry's rate is the mean over its minutes.
+#: The filters :func:`forward_pairs` applies, in order: a pair is labelled with the first
+#: one that drops it, so each pair is counted once.
+DROP_REASONS = (
+    "before the window",
+    "box print",
+    "leg volume under the minimum",
+    "leg price under the minimum",
+    "outside the moneyness band",
+    "too few strikes in its minute",
+)
+ESTIMATORS = ("median", "mean")
 
-    Returns ``FORWARD_COLUMNS``, with ``T`` the expiry's ``T_close``, ``ratio = F/S``
-    and ``source`` either ``"parity"`` or ``"interpolated"``. Raises
-    :class:`MarketDataError` if no expiry has ``min_pairs`` pairs, since then there is
-    nothing to interpolate from.
+
+@dataclass(frozen=True)
+class ParityConfig:
+    """Which same-minute call/put pairs set each expiry's forward, and how.
+
+    Every filter :func:`forward_pairs` applies is a field here, checked in the order of
+    ``DROP_REASONS``; :meth:`describe` says them in words.
     """
-    if pairs is None:
-        pairs = parity_pairs(bars, moneyness_band)
-    expiries = (
-        bars.groupby("expiry", as_index=False)["T_close"].first()
-        .rename(columns={"T_close": "T"}).sort_values("T")
-    )
-    expiries["discount"] = curve.discount(expiries["T"].to_numpy()).detach().numpy()
 
-    discount = curve.discount(pairs["T"].to_numpy()).detach().numpy()
-    forward = pairs["strike"] + pairs["parity"] / discount
-    by_minute = pairs.assign(forward=forward).groupby(_BY_MINUTE).agg(
-        forward=("forward", "mean"), spot=("spot", "first"), T=("T", "first"), n=("strike", "size"),
-    )
-    by_minute["growth"] = np.log(by_minute["forward"] / by_minute["spot"]) / by_minute["T"]
-    parity = by_minute.groupby("expiry").agg(growth=("growth", "mean"), n_pairs=("n", "sum"))
-    parity = parity[parity["n_pairs"] >= min_pairs].reset_index()
-    if parity.empty:
-        raise MarketDataError(f"no expiry has {min_pairs} same-minute call/put pairs")
+    # -- when: ET clock times, "HH:MM"
+    #: End of the window, exclusive, as in ``QuoteConfig``.
+    window_end: str = "16:00"
+    #: Pairs from here to the end set an expiry's forward: the *close* tier.
+    close_start: str = "15:00"
+    #: Earlier pairs, back to here, fill expiries with too few close minutes: the *day*
+    #: tier. ``None`` turns the fill off, leaving those expiries to the curve.
+    fill_start: str | None = "09:30"
 
-    out = expiries.merge(parity, on="expiry", how="left")
-    out["source"] = np.where(out["growth"].notna(), "parity", "interpolated")
-    out["n_pairs"] = out["n_pairs"].fillna(0).astype(int)
+    # -- which pairs
+    #: Drop box-spread prints, which price the box financing rate, not the forward.
+    exclude_boxes: bool = True
+    #: Contracts traded in the minute, on each leg.
+    min_volume: int = 1
+    #: Price of each leg; a leg below one tick is noise.
+    min_price: float = 0.0
+    #: Keep ``|ln(K / S)| <= max(band_sd * sqrt(T), band_floor)``, with the pair's own
+    #: minute's spot: a band in standard deviations (at 100% vol), widening with maturity.
+    band_sd: float = 0.10
+    #: The band's floor, so very short expiries keep more than one strike.
+    band_floor: float = 0.01
+    #: Strikes left in the pair's minute after the filters above.
+    min_strikes: int = 2
 
-    # ln(F/S) interpolated linearly in T is a carry rate held piecewise constant;
-    # beyond the parity expiries, hold the nearest one's rate flat.
-    known = out[out["source"] == "parity"]
-    log_ratio = np.interp(out["T"], known["T"], known["growth"] * known["T"])
-    log_ratio = np.where(out["T"] < known["T"].iloc[0], known["growth"].iloc[0] * out["T"], log_ratio)
-    log_ratio = np.where(out["T"] > known["T"].iloc[-1], known["growth"].iloc[-1] * out["T"], log_ratio)
-    out["ratio"] = np.where(out["growth"].notna(), np.exp(out["growth"] * out["T"]), np.exp(log_ratio))
-    out["forward"] = spot * out["ratio"]
-    return out[FORWARD_COLUMNS].reset_index(drop=True)
+    # -- one forward per expiry
+    #: ``"median"`` or ``"mean"`` of the pairs' cumulative carry.
+    estimator: str = "median"
+    #: Close-tier minutes an expiry needs for a close forward; fewer, and it is filled
+    #: from the day (or left to the curve when ``fill_start`` is ``None``).
+    min_minutes: int = 2
+    #: Smallest standard error, in index points: one minute's spread says little.
+    se_floor_pts: float = 0.5
+    #: Added in quadrature to a day-tier forward's standard error, in index points: the
+    #: forward drifts relative to spot during the day.
+    drift_pts: float = 1.0
+
+    def __post_init__(self):
+        if self.estimator not in ESTIMATORS:
+            raise ValueError(f"estimator must be one of {ESTIMATORS}, got {self.estimator!r}")
+        if self.close_start >= self.window_end:
+            raise ValueError(f"close_start {self.close_start} is not before window_end {self.window_end}")
+        if self.fill_start is not None and self.fill_start > self.close_start:
+            raise ValueError(f"fill_start {self.fill_start} is after close_start {self.close_start}")
+
+    @property
+    def data_start(self) -> str:
+        """The earliest minute any pair can come from."""
+        return self.fill_start or self.close_start
+
+    def describe(self) -> list[str]:
+        """The filters and rules, one line each, in the order they apply."""
+        fill = (f"expiries with fewer than {self.min_minutes} close minutes are filled from pairs since "
+                f"{self.fill_start} ET, standard error widened by {self.drift_pts:g} pts for the intraday drift"
+                if self.fill_start else
+                f"expiries with fewer than {self.min_minutes} close minutes get no forward of their own")
+        return [
+            f"close tier: pairs from {self.close_start} to before {self.window_end} ET",
+            fill,
+            "box prints dropped" if self.exclude_boxes else "box prints kept",
+            f"each leg: volume ≥ {self.min_volume}, price ≥ {self.min_price:g}",
+            f"moneyness: |ln(K/S)| ≤ max({self.band_sd:g}·√T, {self.band_floor:.1%})",
+            f"at least {self.min_strikes} strikes left in the pair's minute",
+            f"forward per expiry: {self.estimator} over its pairs, standard error ≥ {self.se_floor_pts:g} pts",
+        ]
 
 
-def parity_residuals(pairs: pd.DataFrame, forwards: pd.DataFrame, curve: Curve) -> pd.DataFrame:
-    """Each pair's ``C - P`` against the line its expiry's forward implies.
+#: :func:`parity_forwards` output: one row per expiry.
+PARITY_FORWARD_COLUMNS = [
+    "expiry", "option_root", "T", "discount", "y", "y_se", "ratio", "forward", "forward_se", "spot",
+    "n_pairs", "n_minutes", "tier",
+]
 
-    At the pair's minute the forward is that minute's spot grown at the expiry's rate,
-    ``F = S exp(T ln(ratio) / T_close)``, and the line is ``D(T) (F - K)``;
-    ``residual`` is how far the traded ``C - P`` sits from it, in premium.
+
+def forward_pairs(bars: pd.DataFrame, discount: Curve, config: ParityConfig = ParityConfig()) -> pd.DataFrame:
+    """Every same-minute call/put pair in ``bars``, its forward, and what, if anything, drops it.
+
+    ``bars`` is :func:`~torch_pricer.market.market_data.window_bars` output covering
+    ``config.data_start`` to ``config.window_end``, with no price or expiry floor. Each
+    pair gets:
+
+    * ``D = discount(T)``, ``forward = K + (C - P) / D`` and ``ratio = forward / spot``,
+      all at the pair's own minute;
+    * ``y``: the cumulative carry to the close, ``-ln(ratio D) * T_close / T`` -- the carry
+      to the pair's ``T``, at a flat rate over the minutes left until the close;
+    * ``D_close = discount(T_close)``, ``band`` (the moneyness band at its ``T``) and
+      ``tier``, ``"close"`` or ``"day"`` by its minute;
+    * ``dropped_by``: the first of ``DROP_REASONS`` that drops it, ``""`` if kept.
     """
-    fwd = forwards.set_index("expiry")
-    growth = np.log(fwd.loc[pairs["expiry"], "ratio"].to_numpy()) / fwd.loc[pairs["expiry"], "T"].to_numpy()
-    out = pairs.copy()
-    out["discount"] = curve.discount(out["T"].to_numpy()).detach().numpy()
-    out["expiry_forward"] = out["spot"].to_numpy() * np.exp(growth * out["T"].to_numpy())
-    out["fitted"] = out["discount"] * (out["expiry_forward"] - out["strike"])
-    out["residual"] = out["parity"] - out["fitted"]
-    return out
+    pairs = _same_minute_pairs(bars)
+    pairs["is_box"] = _is_box(pairs) if len(pairs) else pd.Series(dtype=bool)
+    t = pairs["T"].to_numpy(dtype=float, copy=True)
+    t_close = pairs["T_close"].to_numpy(dtype=float, copy=True)
+    pairs["D"] = discount.discount(t).detach().numpy()
+    pairs["D_close"] = discount.discount(t_close).detach().numpy()
+    pairs["forward"] = pairs["strike"] + pairs["parity"] / pairs["D"]
+    pairs["ratio"] = pairs["forward"] / pairs["spot"]
+    with np.errstate(divide="ignore", invalid="ignore"):
+        pairs["y"] = -np.log(pairs["ratio"] * pairs["D"]) * t_close / t
+    pairs["band"] = np.maximum(config.band_sd * np.sqrt(t), config.band_floor)
+    clock = pairs["timestamp"].dt.tz_convert(TIMEZONE).dt.strftime("%H:%M")
+    pairs["tier"] = np.where(clock >= config.close_start, "close", "day")
+
+    dropped = pd.Series("", index=pairs.index, dtype=object)
+
+    def drop(mask, reason):
+        dropped[(dropped == "") & mask] = reason
+
+    drop((clock < config.data_start) | (clock >= config.window_end), DROP_REASONS[0])
+    drop(pairs["is_box"] & config.exclude_boxes, DROP_REASONS[1])
+    drop(pairs[["call_volume", "put_volume"]].min(axis=1) < config.min_volume, DROP_REASONS[2])
+    drop(pairs[["call", "put"]].min(axis=1) < config.min_price, DROP_REASONS[3])
+    drop(np.log(pairs["strike"] / pairs["spot"]).abs() > pairs["band"], DROP_REASONS[4])
+    alive = dropped == ""
+    strikes = pairs["strike"].where(alive).groupby([pairs["expiry"], pairs["timestamp"]]).transform("count")
+    drop(strikes < config.min_strikes, DROP_REASONS[5])
+    pairs["dropped_by"] = dropped
+    return pairs.sort_values(["expiry", "timestamp", "strike"]).reset_index(drop=True)
+
+
+def parity_forwards(pairs: pd.DataFrame, config: ParityConfig = ParityConfig()) -> pd.DataFrame:
+    """One forward per expiry from the kept pairs of :func:`forward_pairs`.
+
+    An expiry with ``config.min_minutes`` or more close-tier minutes gets the ``estimator``
+    of its close pairs' ``y`` (tier ``"close"``); otherwise, if ``config.fill_start`` is set,
+    that of all its kept pairs (tier ``"day"``). ``y_se`` is the spread of the per-minute
+    estimates over sqrt(minutes), floored at ``se_floor_pts``, and for the day tier
+    widened by ``drift_pts`` in quadrature. ``forward = spot * ratio`` and ``forward_se`` are
+    in index points at one ``spot`` for every expiry, the last kept minute's, so forwards
+    estimated from different parts of the day compare. Expiries settling at the close
+    (``T_close = 0``) have no carry left and are skipped. Returns
+    ``PARITY_FORWARD_COLUMNS``, sorted by ``T``.
+    """
+    kept = pairs[(pairs["dropped_by"] == "") & (pairs["T_close"] > 0)]
+    if kept.empty:
+        return pd.DataFrame(columns=PARITY_FORWARD_COLUMNS)
+    spot = float(kept.loc[kept["timestamp"].idxmax(), "spot"])
+    floor = config.se_floor_pts / spot
+    rows = []
+    for expiry, g in kept.groupby("expiry"):
+        close = g[g["tier"] == "close"]
+        if close["timestamp"].nunique() >= config.min_minutes:
+            tier, used = "close", close
+        elif config.fill_start is not None:
+            tier, used = "day", g
+        else:
+            continue
+        by_minute = used.groupby("timestamp")["y"].agg(config.estimator)
+        se = by_minute.std() / np.sqrt(len(by_minute)) if len(by_minute) > 1 else np.nan
+        se = max(se, floor) if np.isfinite(se) else floor
+        if tier == "day":
+            se = float(np.hypot(se, config.drift_pts / spot))
+        y = float(used["y"].agg(config.estimator))
+        d_close = float(used["D_close"].iloc[0])
+        ratio = np.exp(-y) / d_close
+        rows.append({
+            "expiry": expiry, "option_root": used["option_root"].iloc[0], "T": float(used["T_close"].iloc[0]),
+            "discount": d_close, "y": y, "y_se": se, "ratio": ratio, "forward": spot * ratio,
+            "forward_se": spot * ratio * se, "spot": spot, "n_pairs": len(used),
+            "n_minutes": len(by_minute), "tier": tier,
+        })
+    return pd.DataFrame(rows, columns=PARITY_FORWARD_COLUMNS).sort_values("T").reset_index(drop=True)

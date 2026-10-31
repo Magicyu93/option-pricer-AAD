@@ -43,7 +43,7 @@ class MarketSnapshot:
 
     # market condition
     discount: Curve
-    dividend: Curve  # or an implied carry curve, when forwards come from parity
+    dividend: Curve  # continuous dividend yield curve: flat, or a term structure
     vol_surface: VolSurface  # implied vol surface for options on this underlying
 
     # misc

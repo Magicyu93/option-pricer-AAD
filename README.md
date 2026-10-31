@@ -9,7 +9,7 @@ The repo has three parts that build on each other:
 |---|---|
 | `data_pipeline/` | Downloads and caches minute bars for options and their underlyings, Treasury yields and dividends (Massive, FRED) |
 | `torch_pricer/` | The library: instruments, curves, vol surfaces, models, the Monte Carlo engine, greeks by autograd |
-| `app/` | A Streamlit app that visualises one day's vol surface, put-call parity, rates and carry |
+| `app/` | A Streamlit app that visualises one day's vol surface, put-call parity, rates and carry, and compares the fitted surface models |
 
 ## Status
 
@@ -17,21 +17,23 @@ The repo has three parts that build on each other:
 |---|---|
 | Monte Carlo engine with Black-Scholes (GBM) | Works. Price, delta, vega, theta and rho from one backward pass; gamma by differencing the pathwise delta |
 | Treasury par yields → zero curve | Works (bootstrap of the CMT curve) |
-| Put-call parity forwards and implied carry | Works |
-| Implied vols per minute bar, SSVI surface fit | Works. The fitted surface still needs checking against the data |
+| Forwards from put-call parity: each pair at the Treasury discount, one forward per expiry, a non-decreasing implied-dividend curve | Works. Every filter is a `ParityConfig` field and a sidebar control in the app |
+| Put-call parity regression for r and q | Works, as a diagnostic only: too noisy to use as an input |
+| Implied vols per minute bar; SSVI, eSSVI and raw SVI surface fits | Works. eSSVI fits best of the arbitrage-free models; compare them on the app's Surface models page |
 | Data pipeline (SPX, SPY; options, stocks, indices, rates, dividends) | Works |
 | Vol surface research app | Works, for cached days of SPX and SPY |
-| Raw SVI, Heston, local vol, Brownian bridge, `BlackScholesModel.calibrate` | Not implemented yet (stubs) |
+| Heston, local vol and LSV models, Brownian bridge, `BlackScholesModel.calibrate` | Not implemented yet (stubs). Dupire's local variance of any surface already works |
 
 Open questions from the research so far, in `scripts/vol_surface_visual.ipynb`:
 - Implied vols computed from out-of-the-money and in-the-money options disagree.
 - Put-call parity is not exact on the trades.
 - Some prices are out of the no-arbitrage bounds, so their implied vol is NaN.
 
-The suspects are the inputs: minute-aggregated trades rather than quotes, and a Treasury
-curve with a flat 1.1% dividend yield for SPX. The app is built to test this. On SPX
-2026-09-10 the forward implied by parity sits about 0.5–4 index points above the forward the
-implied vols use, which matches the sign of the call − put iv gaps.
+The suspects were the inputs: minute-aggregated trades rather than quotes, and a Treasury
+curve with a flat 1.1% dividend yield for SPX. The flat q put the forward 0.5–28 index points
+below what parity implies (more at longer expiries), matching the sign of the call − put iv
+gaps. The forwards now come from parity at the Treasury discount, which centres the
+near-the-money call − put gap on zero in a held-out test over 19 days.
 
 ## Setup
 
@@ -108,35 +110,64 @@ Tests that need cached market data skip themselves when it is missing.
 ## The app
 
 The app shows one day of cached option trades, using the analysis from
-`scripts/vol_surface_visual.ipynb`. It has two pages, and each puts the three things that
-should agree side by side: the rates, the forwards, and the call vs put implied vols.
+`scripts/vol_surface_visual.ipynb`. Two pages put the three things that should agree side
+by side: the rates, the forwards, and the call vs put implied vols. A third fits the
+library's surface models and compares them with each other and with the quotes.
 
-**Sidebar** (applies to both pages):
+**Sidebar** (applies to every page):
 - the underlying and the day, a calendar limited to the cached days;
 - the option roots, e.g. SPXW;
 - the minute window, from 15:30 to before 16:00 ET by default. The end is exclusive: the
   16:00 bar holds trades after the index's closing print;
-- the Treasury provider and lag, and the flat dividend yield;
-- the moneyness band for the parity regression;
+- the Treasury provider and lag;
+- **Forwards: put-call parity**, every filter on the pairs behind the forwards
+  (`ParityConfig`): the close window and the earlier-in-the-day fill, the moneyness band
+  `max(band × √T, floor)`, the estimator, and under *More pair filters* leg volume and price,
+  strikes per minute, close minutes, box prints and the standard-error floor and drift;
+- the moneyness band for the parity regression, a diagnostic only;
 - plot filters: days to expiry, minimum price and max |k|/√T.
 
 **Day overview**, all expiries at once:
+- **Forwards from put-call parity:** the active pair filters in words; implied dividends
+  `S − D·F` per expiry (close tier filled, day tier hollow) with the monotone curve through
+  them and the expiries read off it; each expiry's own forward minus the curve's; and how
+  many pairs each filter drops.
 - **Rates and carry:** the Treasury zero, forward and par curves, with the parity
-  regression's r per expiry overlaid. Next to it, the flat q against the regression's q.
-- **Does parity hold?:** forward error by expiry, call − put iv gap against moneyness, and
-  pairs per expiry.
+  regression's r per expiry overlaid. Next to it, the dividend curve's q against the
+  regression's q.
+- **Does parity hold?:** the curve's forward minus each iv pair's own forward (both at the
+  Treasury discount factor) by expiry, call − put iv gap against moneyness, and pairs per
+  expiry.
 - **The surface:** smiles, an implied-vol 3D plot with the call-put pairs overlaid, and price
   and iv 3D plots side by side.
 - **Per-expiry table:** every number about each expiry. Select a row to open it in the
   drill-down.
 
 **Expiry drill-down**, one expiry:
-- **Metrics:** r, q and the forward from the regression against what the implied vols use,
-  and the gap between the two forwards.
+- **Metrics:** r and q from the regression against what the implied vols use; the expiry's
+  own parity forward (and its tier) against the curve's; the regression's forward gap.
+- **The forward through the day:** every pair's forward minus the curve's, minute by minute
+  over the whole parity window, dropped pairs faint, with why each was dropped.
 - **Parity on the trades:** C − P against strike with two lines, the regression's fit and the
-  Treasury + flat q line, plus the residuals from each.
+  forward curve's, plus the residuals from each.
 - **The vols:** the smile with calls and puts marked differently and pairs joined, and the
   call − put iv gap coloured by minute.
+
+**Surface models**, the library's fits side by side:
+- **What to fit**, in a form at the top: the models (SSVI, eSSVI, raw SVI) and the quotes'
+  floors (days to expiry, price, max |k|/√T). The forwards are the Treasury curve and the
+  parity dividend curve, as on the other pages. Fits are cached; SVI takes about 15 s.
+- **Fit quality:** per model, the error, convergence, fit time and the three arbitrage
+  checks (butterfly, calendar, local variance). Next to it, the error and bias per expiry;
+  below, every quote's error against k/√T, one panel per model.
+- **The surface against the quotes:** a model's fitted surface as a 3D mesh, the quotes as
+  points coloured by their error, and a segment from each quote to the surface.
+- **Smiles:** a grid of expiries with the quotes and every model's smile.
+- **Term structure and local vol:** each model's ATM vol, between the expiries too, against
+  the quotes' ATM vol. Next to it, Dupire's local vol from a chosen model, with cells
+  where the local variance is negative marked.
+- **Details:** the fitted parameters per expiry, the constraints, the forwards, and the
+  quotes dropped.
 
 The app only reads cached data. To see a new day, download it first (step 1).
 
@@ -150,10 +181,12 @@ app/
   pages/
     day_overview.py
     expiry_drilldown.py
+    surface_models.py
   analysis/            research computations taken from the notebook
     implied_vols.py    curve forwards, implied vol per bar, filters, call-put iv pairs
     rate_curves.py     zero / forward / par curve tables
     compare.py         the per-expiry table, and both parity lines for one expiry
+    surface_models.py  the library's surface fits, and the frames and grids the page draws
 ```
 
 The window, the time to settlement and the parity regression come from the library
@@ -186,10 +219,10 @@ looks at the same bars a snapshot is calibrated from.
 | `instruments/listed.py` | `LISTED_PRODUCTS`: contract terms per underlying, i.e. option roots, AM/PM settlement and exercise style (SPX, SPY) |
 | `conventions.py` | Calendars and day counts. The only module that touches QuantLib |
 | `market/market_data.py` | What the market publishes: spot, option and rate quotes, kept apart from fitted objects. `window_bars`: the observation window, with each bar's time to settlement (`T`, from its own minute; AM roots settle 6.5h early) |
-| `market/parity.py` | Put-call parity: same-minute pairs near the money, the minute-demeaned regression for r and q (`regress_parity`, `parity_fit`), and the forward per expiry (`parity_forwards`) |
-| `market/curve/` | The `Curve` interface; `treasury_zero_curve` (par → zero bootstrap); implied carry from the parity forwards |
-| `market/surface/` | The `VolSurface` interface in total variance `w(k, T)`; flat and SSVI surfaces; per-bar implied vols and `fit_surface` |
-| `market/build.py` | `build_snapshot`: one day of data → calibrated `MarketSnapshot`, with a record of every step |
+| `market/parity.py` | Put-call parity. The forwards: `ParityConfig` (every pair filter, by name), `forward_pairs` (each same-minute pair's forward at the Treasury D, labelled with the filter that drops it) and `parity_forwards` (one forward per expiry, close or day tier, with a standard error). The minute-demeaned regression for r and q (`regress_parity`, `parity_fit`) is a diagnostic only |
+| `market/curve/` | The `Curve` interface and `RateCurve`; `treasury_zero_curve` (par → zero bootstrap); `implied_dividend_curve`: the dividend curve through the parity forwards, implied dividends made non-decreasing (weighted isotonic regression); `curve_forwards`: each expiry's forward `S·D_q(T)/D_r(T)` from the two curves |
+| `market/surface/` | The `VolSurface` interface in total variance `w(k, T)`, with butterfly density and Dupire local variance by autograd; flat, SSVI, eSSVI and raw SVI surfaces; per-bar implied vols, `fit_surface` and the arbitrage checks |
+| `market/build.py` | `build_snapshot(frame, rate_quotes, product, settings)`: one day of data → calibrated `MarketSnapshot`, with a record of every step. The dividend curve is implied by put-call parity (`settings.parity_config`); forwards come from it and the Treasury curve |
 | `market/snapshot.py` | `MarketSnapshot`: the calibrated curves and surface, the only input to pricing |
 | `black_formula.py` | Black-76 price, greeks and implied vol |
 | `simulator/` | SDE path generation (GBM in log space, arithmetic BM) and seeded normal draws |

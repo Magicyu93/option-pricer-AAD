@@ -9,8 +9,8 @@ import torch.nn as nn
 from torch import Tensor
 
 from torch_pricer.errors import ValidationError
-from torch_pricer.market.surface.base import VolSurface
-from torch_pricer.tensors import interp_linear
+from torch_pricer.market.surface.base import SliceQuotes, VolSurface
+from torch_pricer.tensors import hermite_slopes, interp_hermite
 
 
 def _inverse_softplus(x: Tensor) -> Tensor:
@@ -21,6 +21,23 @@ def _logit(p: Tensor) -> Tensor:
     return torch.log(p) - torch.log1p(-p)
 
 
+def atm_term_structure(t: Tensor, times: Tensor, theta: Tensor) -> Tensor:
+    """ATM total variance ``theta(T)`` through increasing pillars ``theta``.
+
+    A monotone ``C^1`` cubic between the expiries, so ``dw/dT`` -- and a
+    Dupire local vol -- has no step at them; ``theta_1 T / T_1`` before the
+    first and ``theta_n T / T_n`` after the last (constant ATM vol), joined
+    with matching slopes unless the first or last secant is under a third of
+    them (see :func:`~torch_pricer.tensors.hermite_slopes`).
+    """
+    if times.numel() == 1:
+        return theta[0] * t / times[0]
+    start, end = theta[0] / times[0], theta[-1] / times[-1]
+    clamped = t.clamp(float(times[0]), float(times[-1]))
+    inside = interp_hermite(clamped, times, theta, hermite_slopes(times, theta, start, end))
+    return torch.where(t < times[0], start * t, torch.where(t > times[-1], end * t, inside))
+
+
 class SSVISurface(VolSurface):
     """Total variance at log-moneyness ``k``::
 
@@ -28,8 +45,11 @@ class SSVISurface(VolSurface):
         phi     = eta / (theta^gamma (1 + theta)^(1 - gamma)),   theta = theta(T)
 
     ``theta(T)`` is the ATM total variance: one value per fitted expiry,
-    linear in ``T`` between them, ``theta_1 T / T_1`` before the first and
-    ``theta_n T / T_n`` (constant ATM vol) after the last.
+    a monotone ``C^1`` cubic in ``T`` between them, ``theta_1 T / T_1`` before
+    the first and ``theta_n T / T_n`` (constant ATM vol) after the last
+    (:func:`atm_term_structure`). Before the first expiry the ATM vol is
+    constant but the smile is not frozen: ``phi(theta)`` grows as ``theta``
+    shrinks.
 
     Free of static arbitrage by construction, not by checking: the raw
     parameters are mapped so that
@@ -75,9 +95,9 @@ class SSVISurface(VolSurface):
         self._ref = as_of
 
     @classmethod
-    def initial(cls, expiry_times, atm_total_variance, as_of: dt.date) -> SSVISurface:
+    def initial(cls, slices: tuple[SliceQuotes, ...], as_of: dt.date) -> SSVISurface:
         """The observed ATM term structure, and the default smile shape."""
-        return cls(expiry_times, atm_total_variance, as_of)
+        return cls([q.expiry_time for q in slices], [q.atm_total_variance for q in slices], as_of)
 
     # -- parameters, constrained ------------------------------------------
     @property
@@ -119,17 +139,8 @@ class SSVISurface(VolSurface):
 
     # -- the surface ----------------------------------------------------------
     def atm_variance(self, expiry) -> Tensor:
-        """``theta(T)``: linear between expiries, constant ATM vol outside them."""
-        t = self._as_tensor(expiry)
-        times, theta = self.expiry_times, self.theta
-        if times.numel() == 1:
-            return theta[0] * t / times[0]
-        clamped = t.clamp(float(times[0]), float(times[-1]))
-        inside = interp_linear(clamped, times, theta)
-        return torch.where(
-            t < times[0], theta[0] * t / times[0],
-            torch.where(t > times[-1], theta[-1] * t / times[-1], inside),
-        )
+        """``theta(T)``: smooth between expiries, constant ATM vol outside them."""
+        return atm_term_structure(self._as_tensor(expiry), self.expiry_times, self.theta)
 
     def total_variance(self, k, expiry) -> Tensor:
         theta = self.atm_variance(expiry)
