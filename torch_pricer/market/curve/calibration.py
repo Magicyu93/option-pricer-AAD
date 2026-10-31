@@ -5,16 +5,25 @@
 quote set's Treasury par yields (:func:`~torch_pricer.market.curve.treasury.par_to_zero`);
 a new model (a spread over Treasuries, a parametric curve) is a new function next to it.
 
+**Dividend curve.** :func:`implied_dividend_curve` turns the per-expiry parity forwards
+of :func:`~torch_pricer.market.parity.parity_forwards` into one curve. With
+``F = S D_q / D_r = (S - PV) / D_r``, the dividend discount factor is ``D_q(T) = 1 - PV(T) / S``,
+``PV`` the present value of dividends to ``T``: implied dividends never fall with ``T``, so
+the cumulative carry ``y(T) = -ln D_q(T)`` never falls either. A weighted isotonic
+regression imposes that, and the curve interpolates ``y`` linearly between expiries -- a
+constant forward dividend rate -- which is :class:`RateCurve`'s own rule. The carry also
+absorbs the gap between Treasury rates and the market's funding rate, so it may start
+below zero; the forward is what the market trades at.
+
 **Forwards.** :func:`curve_forwards` gives each expiry's forward from the discount curve
-and a dividend curve, ``F = S D_q(T) / D_r(T)`` -- the snapshot's own
+and the dividend curve, ``F = S D_q(T) / D_r(T)`` -- the snapshot's own
 :meth:`~torch_pricer.market.snapshot.MarketSnapshot.forward`, so the forward that places
-a quote on the surface is the one the pricer uses. The dividend curve is an input
-(flat, or a term structure from a dividend forecast), not backed out of option prices:
-the forwards put-call parity implies on trade prints are too noisy to build on.
+a quote on the surface is the one the pricer uses.
 """
 
 from __future__ import annotations
 
+import numpy as np
 import pandas as pd
 
 from torch_pricer.conventions import tenor_label, tenor_years
@@ -49,6 +58,41 @@ def treasury_curve(quotes: QuoteSet, label: str = "UST") -> RateCurve:
         raise MarketDataError(f"quote set for {quotes.as_of} has no par yields")
     tenors, zeros = par_to_zero([tenor_years(q.tenor) for q in par], [q.rate for q in par])
     return RateCurve.from_zeros(tenors, zeros, label=label)
+
+
+# -- dividend curve ----------------------------------------------------------------
+
+def isotonic(y, weights) -> np.ndarray:
+    """The non-decreasing sequence closest to ``y`` in weighted least squares.
+
+    Pool-adjacent-violators: a value below its predecessor is pooled with it into their
+    weighted mean, repeatedly, so each pool sits between the points it replaces.
+    """
+    pools: list[list[float]] = []  # [value, weight, count]
+    for value, weight in zip(np.asarray(y, dtype=float), np.asarray(weights, dtype=float)):
+        pools.append([value, weight, 1])
+        while len(pools) > 1 and pools[-2][0] > pools[-1][0]:
+            v2, w2, n2 = pools.pop()
+            v1, w1, n1 = pools.pop()
+            pools.append([(v1 * w1 + v2 * w2) / (w1 + w2), w1 + w2, n1 + n2])
+    return np.repeat([p[0] for p in pools], [p[2] for p in pools])
+
+
+def implied_dividend_curve(parity_fwds: pd.DataFrame, label: str = "parity") -> RateCurve:
+    """The dividend curve through the parity forwards, cumulative carry made non-decreasing.
+
+    ``parity_fwds`` is :func:`~torch_pricer.market.parity.parity_forwards` output. Each
+    expiry is a pillar at its ``T``; ``y`` is fitted by :func:`isotonic` with weights
+    ``1 / y_se**2``, so a noisy forward gives way to its neighbours. Beyond the first and
+    last pillar the zero rate is flat. Raises :class:`MarketDataError` with no forwards:
+    there is no flat rate to fall back on that anyone chose.
+    """
+    fw = parity_fwds[parity_fwds["T"] > 0].sort_values("T")
+    if fw.empty:
+        raise MarketDataError("no put-call parity forwards to build a dividend curve from")
+    t = fw["T"].to_numpy(dtype=float, copy=True)
+    y = isotonic(fw["y"], 1.0 / fw["y_se"].to_numpy(dtype=float) ** 2)
+    return RateCurve.from_zeros(t, y / t, label=label)
 
 
 # -- forwards ----------------------------------------------------------------------

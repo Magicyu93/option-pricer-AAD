@@ -9,7 +9,7 @@ import pandas as pd
 import pytest
 import torch
 
-from tests.test_build import DIVIDEND, RATE_QUOTES
+from tests.test_build import RATE_QUOTES
 from tests.test_market_quotes import AS_OF as MARKET_AS_OF
 from tests.test_market_quotes import VOL, _market
 from torch_pricer.errors import ValidationError
@@ -260,7 +260,7 @@ def test_the_new_models_are_selectable_by_name():
 
 def test_a_snapshot_builds_with_an_essvi_surface():
     settings = dataclasses.replace(SnapshotSettings(MARKET_AS_OF), surface_model="eSSVI")
-    run = build_snapshot(_market(minutes=(48, 52, 56)), RATE_QUOTES, DIVIDEND, listed_product("SPX"), settings)
+    run = build_snapshot(_market(minutes=(48, 52, 56)), RATE_QUOTES, listed_product("SPX"), settings)
     assert isinstance(run.snapshot.vol_surface, ESSVISurface)
     spot = run.observations.spot.value
     t = float(run.forwards["T"].iloc[0])

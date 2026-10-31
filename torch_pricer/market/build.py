@@ -15,17 +15,23 @@ discount curve, dividend curve, forwards, implied vols, surface fit -- into a
 The curves and the surface live on the snapshot only, so there is one copy of each.
 
 Input is data, not loaders: the minute-bar frame from the data pipeline's
-``load_market``, the par-yield quotes and the dividend curve, so this module never
-imports the pipeline. The dividend curve is the caller's -- flat, or a term structure
-from a dividend forecast -- and with the discount curve it sets every forward,
-``F = S D_q(T) / D_r(T)``. It is not backed out of put-call parity: on trade prints
-those forwards are too noisy to calibrate to. What differs between underlyings comes from the listed product
-(:mod:`torch_pricer.instruments.listed`); what counts as a usable observation
-from :class:`~torch_pricer.market.market_data.QuoteConfig`.
+``load_market`` and the par-yield quotes, so this module never imports the pipeline.
+The dividend curve is not an input: it is implied by put-call parity on the day's
+trades, each pair's forward taken with the Treasury discount factor
+(:func:`~torch_pricer.market.parity.forward_pairs`), one forward per expiry, and a
+non-decreasing curve of implied dividends through them
+(:func:`~torch_pricer.market.curve.calibration.implied_dividend_curve`). With the
+discount curve it sets every forward, ``F = S D_q(T) / D_r(T)``. Parity's own ``r`` and
+``q`` are never used: on trade prints they are far too noisy. What differs between
+underlyings comes from the listed product (:mod:`torch_pricer.instruments.listed`); what
+counts as a usable observation from :class:`~torch_pricer.market.market_data.QuoteConfig`
+(the surface's quotes) and :class:`~torch_pricer.market.parity.ParityConfig` (the
+pairs behind the forwards).
 """
 
 from __future__ import annotations
 
+import dataclasses
 import datetime as dt
 import time
 from collections import Counter
@@ -39,8 +45,7 @@ from torch_pricer.calibration import CalibrationInputs, CalibrationResult
 from torch_pricer.conventions import DEFAULT_DAY_COUNT
 from torch_pricer.errors import ValidationError
 from torch_pricer.instruments.listed import OptionProduct
-from torch_pricer.market.curve.base import Curve
-from torch_pricer.market.curve.calibration import CURVE_MODELS, curve_forwards
+from torch_pricer.market.curve.calibration import CURVE_MODELS, curve_forwards, implied_dividend_curve
 from torch_pricer.market.market_data import (
     QuoteConfig,
     QuoteSet,
@@ -49,6 +54,7 @@ from torch_pricer.market.market_data import (
     reference_spot,
     window_bars,
 )
+from torch_pricer.market.parity import DROP_REASONS, ParityConfig, forward_pairs, parity_forwards
 from torch_pricer.market.snapshot import MarketSnapshot
 from torch_pricer.market.surface.calibration import SURFACE_MODELS, fit_surface, option_quotes
 
@@ -59,6 +65,7 @@ class SnapshotSettings:
 
     as_of: dt.date
     quote_config: QuoteConfig = field(default_factory=QuoteConfig)
+    parity_config: ParityConfig = field(default_factory=ParityConfig)
     curve_model: str = "Treasury bootstrap"
     surface_model: str = "SSVI"
     max_iter: int = 500
@@ -87,10 +94,11 @@ class SnapshotRun:
     product: OptionProduct
     observations: QuoteSet  # spot, option quotes (with implied vols), par yields
     bars: pd.DataFrame  # the observation window's minute bars
+    parity_forwards: pd.DataFrame  # each expiry's own forward from put-call parity, behind the dividend curve
     forwards: pd.DataFrame  # one forward per expiry, from the discount and dividend curves
     quote_bars: pd.DataFrame  # per-bar forwards and implied vols behind the quotes
     result: CalibrationResult  # the surface fit
-    snapshot: MarketSnapshot  # spot, discount, dividend (the caller's), vol surface
+    snapshot: MarketSnapshot  # spot, discount, dividend (implied by parity), vol surface
     trace: list[StepRecord] = field(default_factory=list)
 
     @property
@@ -109,7 +117,6 @@ def _path(fn) -> str:
 def build_snapshot(
     frame: pd.DataFrame,
     rate_quotes: tuple[RateQuote, ...],
-    dividend: Curve,
     product: OptionProduct,
     settings: SnapshotSettings,
 ) -> SnapshotRun:
@@ -117,11 +124,9 @@ def build_snapshot(
 
     ``frame`` is the data pipeline's ``load_market`` output for that day and
     underlying; ``rate_quotes`` are par yields (see
-    :func:`~torch_pricer.market.curve.calibration.par_yield_quotes`); ``dividend``
-    is the dividend curve and becomes the snapshot's. For a flat yield ``q`` use
-    ``RateCurve.from_zeros([1.0], [q])``, float64 like the discount curve
-    (``RateCurve.flat`` is float32, which rounds the forwards at the seventh digit).
-    Raises :class:`ValidationError` for a product with non-European exercise (its
+    :func:`~torch_pricer.market.curve.calibration.par_yield_quotes`). The dividend
+    curve is implied by put-call parity, from pairs chosen by ``settings.parity_config``
+    over their own window. Raises :class:`ValidationError` for a product with non-European exercise (its
     implied vols would come from a European formula), or an unknown model name.
     """
     if not product.is_european:
@@ -175,11 +180,24 @@ def build_snapshot(
         {"pillars": int(curve.risk_factors.numel())}, {}, started, "snapshot.discount",
     )
 
-    # 3. The dividend curve, as given, and the forwards the two curves imply.
+    # 3. The dividend curve, implied by put-call parity on pairs from their own window.
     started = time.perf_counter()
-    record("Dividend curve", type(dividend), {"source": "caller"}, {},
-           {"label": dividend.label, "pillars": int(dividend.risk_factors.numel())},
-           {}, started, "snapshot.dividend")
+    pc = settings.parity_config
+    parity_window = QuoteConfig(window_start=pc.data_start, window_end=pc.window_end, min_days=0, min_price=0.0)
+    parity_bars, _ = window_bars(frame, as_of, product, parity_window, settings.day_count)
+    pairs = forward_pairs(parity_bars, curve, pc)
+    parity_fw = parity_forwards(pairs, pc)
+    dividend = implied_dividend_curve(parity_fw)
+    tiers = parity_fw["tier"].value_counts()
+    record(
+        "Dividend curve", implied_dividend_curve, {**dataclasses.asdict(pc), "discount": curve.label},
+        {"pairs": len(pairs)},
+        {"pairs kept": int((pairs["dropped_by"] == "").sum()), "close-tier expiries": int(tiers.get("close", 0)),
+         "day-tier expiries": int(tiers.get("day", 0)), "pillars": int(dividend.risk_factors.numel()),
+         "label": dividend.label},
+        {r: int(n) for r, n in pairs["dropped_by"].value_counts().items() if r in DROP_REASONS},
+        started, "snapshot.dividend",
+    )
 
     started = time.perf_counter()
     forwards = curve_forwards(bars, curve, dividend, spot)
@@ -223,7 +241,9 @@ def build_snapshot(
            {"spot": spot}, {}, started, "snapshot")
 
     return SnapshotRun(
-        settings=settings, product=product, observations=observations, bars=bars, forwards=forwards, quote_bars=quote_bars, result=result, snapshot=snapshot, trace=trace,
+        settings=settings, product=product, observations=observations, bars=bars,
+        parity_forwards=parity_fw, forwards=forwards, quote_bars=quote_bars, result=result, snapshot=snapshot,
+        trace=trace,
     )
 
 

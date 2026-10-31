@@ -88,8 +88,8 @@ def _pair_hover(pairs: pd.DataFrame) -> tuple[np.ndarray, str]:
         "%{customdata[0]} K=%{customdata[1]:.0f}, traded %{customdata[2]} ET, spot %{customdata[3]:.2f}<br>"
         "k=%{customdata[4]:.4f}, %{customdata[5]:.2f} days<br>"
         "call %{customdata[6]:.2f} (iv %{customdata[8]:.2f}%), put %{customdata[7]:.2f} (iv %{customdata[9]:.2f}%)<br>"
-        "iv gap %{customdata[10]:+.2f} vol pts, residual vs Treasury + flat q %{customdata[11]:+.2f}<br>"
-        "F: Treasury + flat q %{customdata[12]:.2f}, parity %{customdata[13]:.2f}<extra></extra>"
+        "iv gap %{customdata[10]:+.2f} vol pts, residual vs the forward curve %{customdata[11]:+.2f}<br>"
+        "F: curve %{customdata[12]:.2f}, this pair %{customdata[13]:.2f}<extra></extra>"
     )
     return data.to_numpy(), template
 
@@ -152,13 +152,15 @@ def rates_vs_parity(tables: dict[str, pd.DataFrame], published, expiries: pd.Dat
     return _style(fig, title, 430)
 
 
-def carry_vs_parity(expiries: pd.DataFrame, flat_q: float, zoom: bool) -> go.Figure:
-    """Each expiry's parity-regression q with ±1 se, against the flat q the ivs use."""
+def carry_vs_parity(expiries: pd.DataFrame, zoom: bool) -> go.Figure:
+    """Each expiry's parity-regression q with ±1 se, against the dividend curve's zero rate the ivs use."""
     reg = expiries.dropna(subset=["reg_q"])
     fig = go.Figure()
     t = expiries["T"]
-    fig.add_trace(go.Scatter(x=[t.min(), t.max()], y=[100 * flat_q] * 2, mode="lines", name="flat q (used for ivs)",
-                             line=dict(color=ZERO_COLOR, width=2, dash="dash")))
+    line = expiries[expiries["T"] > 0].sort_values("T")
+    fig.add_trace(go.Scatter(x=line["T"], y=100 * line.curve_q, mode="lines+markers",
+                             name="dividend curve q(T) (used for ivs)", marker=dict(size=4),
+                             line=dict(color=ZERO_COLOR, width=2)))
     fig.add_trace(go.Scatter(
         x=reg["T"], y=100 * reg.reg_q, mode="markers", name="parity regression q ± se",
         marker=dict(color=MUTED, size=8, line=dict(color="white", width=1)),
@@ -169,16 +171,113 @@ def carry_vs_parity(expiries: pd.DataFrame, flat_q: float, zoom: bool) -> go.Fig
     fig.update_xaxes(**_tenor_axis(float(t.min()), float(t.max())))
     fig.update_yaxes(title_text="dividend yield (%)", ticksuffix="%")
     if zoom:
-        _zoom(fig, np.array([100 * flat_q]), 3.0)
-    return _style(fig, "Carry: flat q vs put-call parity", 430)
+        _zoom(fig, 100 * line.curve_q.to_numpy(), 1.0)
+    return _style(fig, "Carry: the parity curve vs the regression", 430)
+
+
+# -- page 1: the forwards ------------------------------------------------------------------
+
+TIER_STYLE = {"close": dict(symbol="circle"), "day": dict(symbol="circle-open")}
+
+
+def implied_dividends(own: pd.DataFrame, line: pd.DataFrame, interpolated: pd.DataFrame) -> go.Figure:
+    """Implied dividends PV(T) in index points: each expiry's own ± se, the curve through them,
+    and the expiries priced off the curve."""
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(x=line.days, y=line.PV, mode="lines", name="dividend curve",
+                             line=dict(color=ZERO_COLOR, width=2)))
+    for tier, style in TIER_STYLE.items():
+        part = own[own.tier == tier]
+        if part.empty:
+            continue
+        fig.add_trace(go.Scatter(
+            x=part.days, y=part.PV, mode="markers", name=f"{tier} tier ± se",
+            marker=dict(color=POINT_COLOR, size=9, line=dict(color=POINT_COLOR, width=2), **style),
+            error_y=dict(type="data", array=part.PV_se, color=POINT_COLOR, thickness=1),
+            customdata=np.column_stack([part.expiry.astype(str), part.days, part.n_pairs, part.n_minutes,
+                                        part.forward, part.forward_se, part.PV_curve]),
+            hovertemplate=("%{customdata[0]} (%{customdata[1]:.1f}d), %{customdata[2]} pairs in %{customdata[3]} "
+                           "minutes<br>PV %{y:.2f} (curve %{customdata[6]:.2f})<br>forward %{customdata[4]:,.2f} "
+                           "± %{customdata[5]:.2f}<extra></extra>")))
+    if len(interpolated):
+        fig.add_trace(go.Scatter(
+            x=interpolated.days, y=interpolated.PV, mode="markers", name="no pairs: on the curve",
+            marker=dict(color=MUTED, size=7, symbol="x"),
+            customdata=np.column_stack([interpolated.expiry.astype(str), interpolated.days]),
+            hovertemplate="%{customdata[0]} (%{customdata[1]:.1f}d)<br>PV %{y:.2f}<extra></extra>"))
+    fig.update_xaxes(**_log_days_axis(pd.concat([line.days, own.days])))
+    fig.update_yaxes(title_text="PV of dividends to T (index points)")
+    return _style(fig, "Implied dividends: S − D·F", 430)
+
+
+def own_vs_curve(expiries: pd.DataFrame) -> go.Figure:
+    """Each expiry's own parity forward minus the curve's, ± its se: what the monotone fit moved."""
+    own = expiries.dropna(subset=["own_gap"])
+    fig = go.Figure()
+    for tier, style in TIER_STYLE.items():
+        part = own[own.tier == tier]
+        if part.empty:
+            continue
+        fig.add_trace(go.Scatter(
+            x=part.days, y=part.own_gap, mode="markers", name=f"{tier} tier ± se",
+            marker=dict(color=POINT_COLOR, size=9, line=dict(color=POINT_COLOR, width=2), **style),
+            error_y=dict(type="data", array=part.parity_forward_se, color=POINT_COLOR, thickness=1),
+            customdata=np.column_stack([part.expiry.astype(str), part.days, part.parity_forward]),
+            hovertemplate=("%{customdata[0]} (%{customdata[1]:.1f}d)<br>own %{customdata[2]:,.2f}, "
+                           "%{y:+.2f} from the curve<extra></extra>")))
+    fig.add_hline(y=0, line=dict(color=MUTED, width=1))
+    fig.update_xaxes(**_log_days_axis(own.days if len(own) else pd.Series([1.0, 365.0])))
+    fig.update_yaxes(title_text="index points")
+    return _style(fig, "Own forward − curve", 430)
+
+
+def filter_funnel(funnel: pd.DataFrame) -> go.Figure:
+    """Pairs dropped by each filter, in the order they apply, and those kept, by tier."""
+    steps = [f"{step} ({n:,})" for step, n in zip(funnel.step[::-1], funnel.total[::-1])]
+    fig = go.Figure([
+        go.Bar(y=steps, x=funnel.close[::-1], orientation="h", name="close tier", marker_color=POINT_COLOR),
+        go.Bar(y=steps, x=funnel.day[::-1], orientation="h", name="day tier", marker_color=EXPIRY_RAMP[0]),
+    ])
+    fig.update_layout(barmode="stack")
+    fig.update_xaxes(type="log", title_text="pairs (log)")
+    return _style(fig, f"Pairs: {int(funnel.total.sum()):,} matched, "
+                       f"{int(funnel.set_index('step').total.get('kept', 0)):,} kept", 430)
+
+
+def intraday_forward(pairs: pd.DataFrame, minutes: pd.DataFrame, close_start: str) -> go.Figure:
+    """One expiry's pair forwards through the day minus the curve's, dropped pairs faint."""
+    fig = go.Figure()
+    dropped = pairs[pairs.dropped_by != ""]
+    kept = pairs[pairs.dropped_by == ""]
+    if len(dropped):
+        fig.add_trace(go.Scattergl(
+            x=dropped.time, y=dropped.gap, mode="markers", name="dropped pair",
+            marker=dict(color=MUTED, size=4, opacity=0.35),
+            customdata=np.column_stack([dropped.strike, dropped.dropped_by]),
+            hovertemplate="K=%{customdata[0]:.0f}: %{y:+.2f}<br>%{customdata[1]}<extra></extra>"))
+    if len(kept):
+        fig.add_trace(go.Scattergl(
+            x=kept.time, y=kept.gap, mode="markers", name="kept pair",
+            marker=dict(color=POINT_COLOR, size=5, opacity=0.6), customdata=kept.strike,
+            hovertemplate="K=%{customdata:.0f}: %{y:+.2f}<extra></extra>"))
+        fig.add_trace(go.Scatter(x=minutes.time, y=minutes.gap, mode="markers", name="minute median (kept)",
+                                 marker=dict(color=ACCENT, size=9, symbol="diamond"), customdata=minutes.n,
+                                 hovertemplate="%{x|%H:%M}: %{y:+.2f}, %{customdata} pairs<extra></extra>"))
+    fig.add_hline(y=0, line=dict(color=MUTED, width=1))
+    if len(pairs):
+        day = pairs.time.iloc[0].strftime("%Y-%m-%d")
+        fig.add_vline(x=pd.Timestamp(f"{day} {close_start}"), line=dict(color=MUTED, dash="dot", width=1))
+    fig.update_xaxes(title_text="time (ET); dotted: close tier starts")
+    fig.update_yaxes(title_text="pair forward − curve (index points)")
+    return _style(fig, "The forward through the day", 420)
 
 
 # -- page 1: does parity hold ------------------------------------------------------------
 
 
 def forward_error_by_expiry(by_expiry: pd.DataFrame) -> go.Figure:
-    """Median ``F - F_pair`` per expiry (Treasury + flat q forward minus the pair's forward at
-    the parity regression's D), with the middle half of the pairs as an error bar."""
+    """Median ``F - F_pair`` per expiry (the curve's forward minus each pair's own, both at the
+    Treasury D), with the middle half of the pairs as an error bar."""
     fig = go.Figure(go.Scatter(
         x=by_expiry.days, y=by_expiry.F_error_median, mode="markers",
         marker=_day_marker(by_expiry.days, by_expiry.days, showscale=False, size=9, line=dict(color="white", width=1)),
@@ -191,7 +290,7 @@ def forward_error_by_expiry(by_expiry: pd.DataFrame) -> go.Figure:
     fig.add_hline(y=0, line=dict(color=MUTED, width=1))
     fig.update_xaxes(**_log_days_axis(by_expiry.days))
     fig.update_yaxes(title_text="index points")
-    return _style(fig, "Forward: Treasury + flat q − parity", 380)
+    return _style(fig, "Forward: the curve − each iv pair's own", 380)
 
 
 def iv_gap_vs_k(pairs: pd.DataFrame) -> go.Figure:
@@ -355,7 +454,7 @@ def expiry_parity(pairs: pd.DataFrame, lines: pd.DataFrame) -> go.Figure:
     fig.add_trace(go.Scatter(x=lines.strike, y=lines.regression, mode="lines", name="regression: A − D·K",
                              line=dict(color=MUTED, width=2)))
     fig.add_trace(go.Scatter(x=lines.strike, y=lines.curve, mode="lines",
-                             name="Treasury + flat q: D(F − K)", line=dict(color=ZERO_COLOR, width=2, dash="dash")))
+                             name="forward curve: D(F − K)", line=dict(color=ZERO_COLOR, width=2, dash="dash")))
     fig.update_xaxes(title_text="strike K")
     fig.update_yaxes(title_text="C − P (index points)")
     return _style(fig, "C − P against strike", 420)
@@ -368,7 +467,7 @@ def expiry_residuals(pairs: pd.DataFrame) -> go.Figure:
         go.Scattergl(x=pairs.strike, y=pairs.resid_regression, mode="markers", name="vs regression",
                      marker=dict(color=MUTED, size=6, opacity=0.7), customdata=time,
                      hovertemplate="K=%{x:.0f}, %{customdata} ET: %{y:+.2f}<extra></extra>"),
-        go.Scattergl(x=pairs.strike, y=pairs.resid_curve, mode="markers", name="vs Treasury + flat q",
+        go.Scattergl(x=pairs.strike, y=pairs.resid_curve, mode="markers", name="vs the forward curve",
                      marker=dict(color=ZERO_COLOR, size=6, opacity=0.7, symbol="x"), customdata=time,
                      hovertemplate="K=%{x:.0f}, %{customdata} ET: %{y:+.2f}<extra></extra>"),
     ])

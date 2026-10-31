@@ -27,9 +27,9 @@ CURVE = RateCurve.from_zeros(
 )
 
 
-def _years(minute: int, expiry: str) -> float:
-    """ACT/365 from 15:mm on AS_OF to a PM settlement at 16:00 on ``expiry``."""
-    return ((dt.date.fromisoformat(expiry) - AS_OF).days + (60 - minute) / (60 * 24)) / 365.0
+def _years(minute: int, expiry: str, hour: int = 15) -> float:
+    """ACT/365 from hh:mm on AS_OF to a PM settlement at 16:00 on ``expiry``."""
+    return ((dt.date.fromisoformat(expiry) - AS_OF).days + (16 * 60 - hour * 60 - minute) / (60 * 24)) / 365.0
 
 
 def _row(minute, root, expiry, right, strike, price, spot, volume=10, hour=15):
@@ -47,23 +47,25 @@ def _row(minute, root, expiry, right, strike, price, spot, volume=10, hour=15):
     }
 
 
-def _market(expiries=("2026-10-16", "2026-12-18"), minutes=(50, 55), strikes=None, noise=0.0, seed=0):
+def _market(expiries=("2026-10-16", "2026-12-18"), minutes=(50, 55), strikes=None, noise=0.0, seed=0,
+            carry=None, hour=15):
     """Black prices for both rights at every strike and minute, spot drifting by minute.
 
-    Each minute is priced at its own time to settlement, as a real trade is.
+    Each minute is priced at its own time to settlement, as a real trade is. ``carry``
+    maps expiry to its dividend yield; every expiry not in it carries ``CARRY``.
     """
     rng = np.random.default_rng(seed)
     rows = []
     for minute in minutes:
         spot = 7600.0 + (minute - 50)  # one point a minute
         for expiry in expiries:
-            t = _years(minute, expiry)
-            forward = spot * np.exp((RATE - CARRY) * t)
+            t = _years(minute, expiry, hour)
+            forward = spot * np.exp((RATE - (carry or {}).get(expiry, CARRY)) * t)
             for strike in strikes or np.arange(7300.0, 7950.0, 50.0):
                 for right in (1, -1):
                     price = black_price(forward, strike, t, VOL, np.exp(-RATE * t), right)
                     price = float(price) * (1 + noise * rng.standard_normal())
-                    rows.append(_row(minute, "SPXW", expiry, right, strike, price, spot))
+                    rows.append(_row(minute, "SPXW", expiry, right, strike, price, spot, hour=hour))
     return pd.DataFrame(rows)
 
 

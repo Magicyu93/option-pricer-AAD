@@ -4,9 +4,9 @@ Rows are :func:`torch_pricer.market.market_data.window_bars` output: one contrac
 bar in one minute, with ``T`` from that minute to the contract's settlement (the library's
 rule: SPXW at the 16:00 close, SPX monthlies at the open). For each row:
 
-* ``r``  the curve's zero rate to ``T``; ``D = exp(-r T)``
-* ``F``  the forward grown from that minute's spot, ``F = S exp((r - q) T)``, ``q`` a flat
-  dividend yield
+* ``r``  the Treasury curve's zero rate to ``T``; ``D = exp(-r T)``
+* ``F``  the forward grown from that minute's spot, ``F = S D_q(T) / D``, ``D_q`` the
+  dividend curve's discount factor -- the library's curve implied by put-call parity
 * ``iv`` Black-76 inversion of the bar's price on ``(F, K, T, D)``
 """
 
@@ -18,20 +18,19 @@ import pandas as pd
 from torch_pricer.black_formula import implied_vol
 from torch_pricer.market.market_data import TIMEZONE
 
-DIVIDEND_YIELD = 0.011  # flat continuous SPX dividend yield
 KEYS = ["option_root", "expiry", "strike", "option_type"]  # one contract
 
 
-def curve_forward(spot, T, curve, dividend_yield: float = DIVIDEND_YIELD):
-    """Zero rate r(T), discount D = exp(-r T) and forward F = S exp((r - q) T) from ``curve``."""
-    T = np.asarray(T, dtype=float)
-    r = curve.zero_rate(np.maximum(T, 0.0)).detach().numpy()
+def curve_forward(spot, T, curve, dividend):
+    """Zero rate r(T), discount D = exp(-r T) and forward F = S D_q(T) / D from the two curves."""
+    T = np.maximum(np.asarray(T, dtype=float), 0.0)
+    r = curve.zero_rate(T.copy()).detach().numpy()
     discount = np.exp(-r * T)
-    forward = np.asarray(spot, dtype=float) * np.exp((r - dividend_yield) * T)
+    forward = np.asarray(spot, dtype=float) * dividend.discount(T.copy()).detach().numpy() / discount
     return r, discount, forward
 
 
-def contract_implied_vols(bars: pd.DataFrame, curve, dividend_yield: float = DIVIDEND_YIELD) -> pd.DataFrame:
+def contract_implied_vols(bars: pd.DataFrame, curve, dividend) -> pd.DataFrame:
     """``bars`` with ``option_type``, r, discount, forward, k = ln(K/F) and iv.
 
     iv is nan where no vol reproduces the price: below intrinsic, or no time value left
@@ -39,7 +38,7 @@ def contract_implied_vols(bars: pd.DataFrame, curve, dividend_yield: float = DIV
     """
     out = bars.copy()
     out["option_type"] = np.where(out.right > 0, "call", "put")
-    out["r"], out["discount"], out["forward"] = curve_forward(out.spot, out["T"], curve, dividend_yield)
+    out["r"], out["discount"], out["forward"] = curve_forward(out.spot, out["T"], curve, dividend)
     out["k"] = np.log(out.strike / out.forward)
     out["iv"] = implied_vol(out.price, out.forward, out.strike, out["T"], out.discount, out.right)
     return out
@@ -113,19 +112,18 @@ def near_the_money(points: pd.DataFrame, band: float = 0.05) -> pd.Series:
     return points.k.abs() <= band * np.sqrt(points["T"])
 
 
-def call_put_pairs(contract_vols: pd.DataFrame, parity_discount: pd.Series, **filters) -> pd.DataFrame:
+def call_put_pairs(contract_vols: pd.DataFrame, **filters) -> pd.DataFrame:
     """A call and a put at the same root, expiry, strike and minute, both passing the filters.
 
-    ``iv_gap = iv_call - iv_put`` in vol points. Two sides, each with its own discount:
+    ``iv_gap = iv_call - iv_put`` in vol points. Against the F and D the ivs were computed
+    with -- the Treasury curve and the parity dividend curve:
 
-    * Treasury + flat q, the F and D the ivs were computed with:
-      ``parity_residual = (C - P) - D (F - K)``;
-    * put-call parity, with ``parity_discount`` (the regression's D, indexed by expiry):
-      ``F_pair = K + (C - P) / D_parity``, NaN for an expiry with no regression.
+    * ``parity_residual = (C - P) - D (F - K)``;
+    * ``F_pair = K + (C - P) / D``, the pair's own forward at the same Treasury D, and
+      ``F_error = F - F_pair``, the curve's forward minus it, in index points.
 
-    ``F_error = F - F_pair`` compares the two forwards in index points. Per-minute rows
-    only: a combined row averages a call and a put over different minutes, so their gap
-    would mix timing into parity.
+    Per-minute rows only: a combined row averages a call and a put over different
+    minutes, so their gap would mix timing into parity.
     """
     if not is_per_minute(contract_vols):
         raise ValueError("call_put_pairs needs per-minute rows: contract_vol_summary(..., combine=False)")
@@ -139,8 +137,7 @@ def call_put_pairs(contract_vols: pd.DataFrame, parity_discount: pd.Series, **fi
     pairs["iv_gap"] = 100 * (pairs.iv_call - pairs.iv_put)
     pairs["parity"] = pairs.price_call - pairs.price_put
     pairs["parity_residual"] = pairs.parity - pairs.discount * (pairs.forward - pairs.strike)
-    pairs["parity_discount"] = pairs.expiry.map(parity_discount)
-    pairs["F_pair"] = pairs.strike + pairs.parity / pairs.parity_discount
+    pairs["F_pair"] = pairs.strike + pairs.parity / pairs.discount
     pairs["F_error"] = pairs.forward - pairs.F_pair
     return pairs.sort_values(["expiry", "strike", "timestamp"], ignore_index=True)
 
@@ -148,8 +145,7 @@ def call_put_pairs(contract_vols: pd.DataFrame, parity_discount: pd.Series, **fi
 def parity_by_expiry(pairs: pd.DataFrame) -> pd.DataFrame:
     """Per expiry of :func:`call_put_pairs`: the pairs with an ``F_pair``, mean days, the
     average ``discount`` and ``forward`` (the line ``D (F - K)``), and the median and middle
-    half (25%-75%) of ``F_error`` and ``parity_residual``. Expiries with no parity regression
-    have no ``F_error``; the caller drops them."""
+    half (25%-75%) of ``F_error`` and ``parity_residual``."""
     def q25(s):
         return s.quantile(0.25)
 

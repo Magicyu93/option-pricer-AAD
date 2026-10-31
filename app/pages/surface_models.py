@@ -14,6 +14,7 @@ cache.caption(s)
 if cache.window(s).empty:
     st.warning("No bars in this window for the chosen roots.")
     st.stop()
+cache.require_forwards(s)
 
 # -- what to fit -------------------------------------------------------------------------
 with st.form("fit_settings"):
@@ -25,7 +26,8 @@ with st.form("fit_settings"):
     st.form_submit_button("Fit")
 st.caption("The library's fit, as in a snapshot: one quote per contract, out of the money, its iv averaged by "
            "volume over the window's bars, weighted by sqrt(volume) × the vega shape. Forwards are the Treasury "
-           "curve and the flat q, as on the other pages. The window, rates and q come from the sidebar; the sidebar's plot filters don't apply here. A fit is cached once it has run "
+           "curve and the put-call parity dividend curve, as on the other pages. The window, rates and parity "
+           "filters come from the sidebar; the sidebar's plot filters don't apply here. A fit is cached once it has run "
            "(SVI takes about 15 s).")
 if not models:
     st.info("Pick at least one model.")
@@ -74,8 +76,8 @@ c1.dataframe(summary, hide_index=True, width="stretch", column_config={
 })
 fw = inputs.forwards
 c1.caption(f"{len(inputs.quotes):,} quotes over {resid.expiry.nunique()} expiries, from "
-           f"{len(inputs.quote_bars):,} bars; reference spot {inputs.spot:,.2f}; forwards from Treasury + "
-           f"flat q = {s.dividend_yield:.2%}.")
+           f"{len(inputs.quote_bars):,} bars; reference spot {inputs.spot:,.2f}; forwards from the Treasury "
+           "curve and the parity dividend curve.")
 per_expiry = cache.per_expiry_errors(s, fs, models)
 c2.plotly_chart(plots.model_errors_by_expiry(per_expiry), width="stretch")
 st.plotly_chart(plots.residuals_by_model(resid, list(models)), width="stretch")

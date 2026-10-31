@@ -3,8 +3,8 @@
 The fits are the library's own (``option_quotes`` and ``fit_surface``, as in
 ``build_snapshot``); what is here turns them into frames for the page: a summary per
 model, errors per expiry and per quote, smiles and the surface on grids, the ATM term
-structure and Dupire's local vol. The forwards are the Treasury curve and a flat q, as on
-the other pages: the forwards backed out of put-call parity are too noisy to fit to.
+structure and Dupire's local vol. The forwards are the Treasury curve and the dividend
+curve implied by put-call parity, as on the other pages and in a snapshot.
 """
 
 from __future__ import annotations
@@ -18,7 +18,6 @@ import pandas as pd
 import torch
 
 from torch_pricer.calibration import CalibrationResult
-from torch_pricer.market.curve import RateCurve
 from torch_pricer.market.curve.calibration import curve_forwards
 from torch_pricer.market.market_data import QuoteConfig, reference_spot
 from torch_pricer.market.surface.base import VolSurface
@@ -47,16 +46,7 @@ class ModelFit:
     seconds: float
 
 
-def flat_q_forwards(bars: pd.DataFrame, curve, spot: float, dividend_yield: float) -> pd.DataFrame:
-    """The library's forwards from the curve and a flat dividend yield: ``F = S e^{-qT} / D(T)``.
-
-    The flat curve is built with ``from_zeros``, in float64 like the discount curve:
-    ``RateCurve.flat`` is float32 and would round the forward at the seventh digit.
-    """
-    return curve_forwards(bars, curve, RateCurve.from_zeros([1.0], [dividend_yield], "flat_q"), spot)
-
-
-def fit_inputs(bars: pd.DataFrame, curve, config: QuoteConfig, dividend_yield: float) -> FitInputs:
+def fit_inputs(bars: pd.DataFrame, curve, config: QuoteConfig, dividend) -> FitInputs:
     """The quotes and forwards a fit takes, from ``window_bars`` output.
 
     ``bars`` may hold short expiries and cheap prints: ``config.min_days`` and
@@ -67,7 +57,7 @@ def fit_inputs(bars: pd.DataFrame, curve, config: QuoteConfig, dividend_yield: f
     dropped = {"under min days": int((~long_enough).sum()), "under min price": int((long_enough & ~keep).sum())}
     bars = bars[keep].reset_index(drop=True)
     spot = reference_spot(bars)
-    forwards = flat_q_forwards(bars, curve, spot, dividend_yield)
+    forwards = curve_forwards(bars, curve, dividend, spot)
     quotes, quote_bars, drops = option_quotes(bars, forwards, config)
     return FitInputs(quotes, quote_bars, forwards, spot, {**dropped, **drops})
 
